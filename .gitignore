@@ -1,0 +1,22 @@
+# Entorno virtual y artefactos de Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Estado local de marimo
+__marimo__/
+
+# Datos privados, bases generadas y resultados locales
+/data/
+/datos/
+/resultados/
+*.sqlite
+*.sqlite-*
+*.sqlite.lock
+*.parcial.sqlite*
+
+# Configuracion y metadatos locales
+.env
+.env.*
+!.env.example
+*:Zone.Identifier

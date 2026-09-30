@@ -1,2 +1,4 @@
 marimo
 ijson
+pandas
+scikit-learn

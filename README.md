@@ -6,7 +6,6 @@ Proyecto académico para estimar la duración de un viaje al salir y actualizar 
 
 **Modalidad del equipo:** cada integrante tiene el código compartido, una copia local de los mismos tres JSON y su propia base SQLite. Los datos grandes no se suben al repositorio.
 
-> Esta guía usa `eta.py` como nombre de la notebook. Si en el repositorio tiene otro nombre, reemplazarlo en los comandos. Abrir la notebook existente del equipo, no crear una nueva vacía.
 
 ## Contenido
 
@@ -27,7 +26,7 @@ Para esta etapa **no hacen falta GPU, MongoDB, MySQL, un servidor OSRM, una cuen
 Clonar o descargar el repositorio compartido y organizarlo así:
 
 ```text
-proyecto_eta/
+LabIA/
 ├── README.md
 ├── eta.py                         # Notebook de marimo del equipo
 ├── eta_importacion.py              # Funciones de importación y consulta

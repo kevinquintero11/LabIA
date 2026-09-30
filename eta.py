@@ -230,5 +230,293 @@ def _(BASE_ETA_LISTA, consultar_base, mo):
     return
 
 
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ## Primer experimento supervisado
+
+    Esta prueba predice la duración en minutos de una observación de segmento.
+    Usa una muestra acotada y separa cronológicamente el 80 % más antiguo para
+    entrenamiento y el 20 % más reciente para prueba. Todavía no representa
+    la duración completa de un viaje.
+    """)
+    return
+
+
+@app.cell
+def _():
+    import pandas as pd
+
+    from sklearn.compose import ColumnTransformer
+    from sklearn.dummy import DummyRegressor
+    from sklearn.linear_model import LinearRegression
+    from sklearn.metrics import mean_absolute_error, mean_squared_error
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import OneHotEncoder
+
+    return (
+        ColumnTransformer,
+        DummyRegressor,
+        OneHotEncoder,
+        Pipeline,
+        LinearRegression,
+        mean_absolute_error,
+        mean_squared_error,
+        pd,
+    )
+
+
+@app.cell
+def _(BASE_ETA_LISTA, consultar_base, mo, pd):
+    TAMANIO_MUESTRA_ETA = 10_000
+
+    filas_modelo_eta = consultar_base(
+        BASE_ETA_LISTA,
+        """
+        SELECT
+            observacion_n,
+            flota_id,
+            fecha_utc,
+            nodo_origen,
+            nodo_destino,
+            franja_horaria,
+            tiempo_real_seg
+        FROM observaciones
+        WHERE campos_minimos_ok = 1
+          AND tiempo_real_seg > 0
+        LIMIT 10000
+        """,
+        max_filas=TAMANIO_MUESTRA_ETA,
+    )
+
+    datos_modelo_eta = pd.DataFrame(filas_modelo_eta)
+    mo.stop(
+        datos_modelo_eta.empty,
+        mo.md("No hay observaciones válidas para entrenar el modelo."),
+    )
+
+    datos_modelo_eta["fecha_utc"] = pd.to_datetime(
+        datos_modelo_eta["fecha_utc"],
+        utc=True,
+        errors="coerce",
+    )
+    datos_modelo_eta = (
+        datos_modelo_eta.dropna(subset=["fecha_utc", "tiempo_real_seg"])
+        .sort_values("fecha_utc")
+        .reset_index(drop=True)
+    )
+
+    mo.stop(
+        len(datos_modelo_eta) < 10,
+        mo.md("Se necesitan al menos 10 observaciones válidas para esta prueba."),
+    )
+
+    mo.ui.table(
+        [
+            {
+                "filas": len(datos_modelo_eta),
+                "desde": str(datos_modelo_eta["fecha_utc"].min()),
+                "hasta": str(datos_modelo_eta["fecha_utc"].max()),
+            }
+        ],
+        selection=None,
+    )
+    return TAMANIO_MUESTRA_ETA, datos_modelo_eta, filas_modelo_eta
+
+
+@app.cell
+def _(datos_modelo_eta, mo):
+    datos_entrenamiento_eta = datos_modelo_eta.copy()
+    datos_entrenamiento_eta["hora"] = datos_entrenamiento_eta[
+        "fecha_utc"
+    ].dt.hour
+    datos_entrenamiento_eta["dia_semana"] = datos_entrenamiento_eta[
+        "fecha_utc"
+    ].dt.dayofweek
+
+    columnas_categoricas_eta = [
+        "flota_id",
+        "nodo_origen",
+        "nodo_destino",
+        "franja_horaria",
+    ]
+    for _columna in columnas_categoricas_eta:
+        datos_entrenamiento_eta[_columna] = (
+            datos_entrenamiento_eta[_columna]
+            .fillna("desconocido")
+            .astype(str)
+        )
+
+    columnas_modelo_eta = columnas_categoricas_eta + [
+        "hora",
+        "dia_semana",
+    ]
+    X_eta = datos_entrenamiento_eta[columnas_modelo_eta]
+    y_eta = datos_entrenamiento_eta["tiempo_real_seg"] / 60.0
+
+    corte_eta = int(len(datos_entrenamiento_eta) * 0.8)
+    X_entrenamiento_eta = X_eta.iloc[:corte_eta]
+    X_prueba_eta = X_eta.iloc[corte_eta:]
+    y_entrenamiento_eta = y_eta.iloc[:corte_eta]
+    y_prueba_eta = y_eta.iloc[corte_eta:]
+
+    resumen_particion_eta = [
+        {
+            "conjunto": "entrenamiento",
+            "filas": len(X_entrenamiento_eta),
+            "porcentaje": 80,
+            "desde": str(datos_entrenamiento_eta["fecha_utc"].iloc[0]),
+            "hasta": str(
+                datos_entrenamiento_eta["fecha_utc"].iloc[corte_eta - 1]
+            ),
+        },
+        {
+            "conjunto": "prueba",
+            "filas": len(X_prueba_eta),
+            "porcentaje": 20,
+            "desde": str(datos_entrenamiento_eta["fecha_utc"].iloc[corte_eta]),
+            "hasta": str(datos_entrenamiento_eta["fecha_utc"].iloc[-1]),
+        },
+    ]
+
+    mo.ui.table(resumen_particion_eta, selection=None)
+    return (
+        X_entrenamiento_eta,
+        X_prueba_eta,
+        columnas_categoricas_eta,
+        columnas_modelo_eta,
+        corte_eta,
+        datos_entrenamiento_eta,
+        resumen_particion_eta,
+        y_entrenamiento_eta,
+        y_prueba_eta,
+    )
+
+
+@app.cell
+def _(mo):
+    boton_entrenamiento_eta = mo.ui.run_button(
+        label="Entrenar modelos con la división 80/20"
+    )
+    boton_entrenamiento_eta
+    return (boton_entrenamiento_eta,)
+
+
+@app.cell
+def _(
+    ColumnTransformer,
+    DummyRegressor,
+    OneHotEncoder,
+    Pipeline,
+    LinearRegression,
+    X_entrenamiento_eta,
+    X_prueba_eta,
+    boton_entrenamiento_eta,
+    columnas_categoricas_eta,
+    mean_absolute_error,
+    mean_squared_error,
+    mo,
+    pd,
+    y_entrenamiento_eta,
+    y_prueba_eta,
+):
+    mo.stop(
+        not boton_entrenamiento_eta.value,
+        mo.md("Presioná el botón para entrenar y comparar los modelos."),
+    )
+
+    modelo_base_eta = DummyRegressor(strategy="median")
+    modelo_base_eta.fit(
+        X_entrenamiento_eta[["hora"]],
+        y_entrenamiento_eta,
+    )
+    prediccion_base_eta = modelo_base_eta.predict(X_prueba_eta[["hora"]])
+
+    preprocesamiento_eta = ColumnTransformer(
+        transformers=[
+            (
+                "categorias",
+                OneHotEncoder(handle_unknown="ignore"),
+                columnas_categoricas_eta,
+            )
+        ],
+        remainder="passthrough",
+    )
+    modelo_lineal_eta = Pipeline(
+        steps=[
+            ("preprocesamiento", preprocesamiento_eta),
+            ("regresion", LinearRegression()),
+        ]
+    )
+    modelo_lineal_eta.fit(X_entrenamiento_eta, y_entrenamiento_eta)
+    prediccion_lineal_eta = modelo_lineal_eta.predict(X_prueba_eta)
+
+    resultados_modelos_eta = pd.DataFrame(
+        [
+            {
+                "modelo": "Mediana",
+                "MAE_min": mean_absolute_error(
+                    y_prueba_eta,
+                    prediccion_base_eta,
+                ),
+                "RMSE_min": mean_squared_error(
+                    y_prueba_eta,
+                    prediccion_base_eta,
+                )
+                ** 0.5,
+            },
+            {
+                "modelo": "Regresión lineal",
+                "MAE_min": mean_absolute_error(
+                    y_prueba_eta,
+                    prediccion_lineal_eta,
+                ),
+                "RMSE_min": mean_squared_error(
+                    y_prueba_eta,
+                    prediccion_lineal_eta,
+                )
+                ** 0.5,
+            },
+        ]
+    ).round(3)
+
+    mo.ui.table(resultados_modelos_eta, selection=None)
+    return (
+        modelo_base_eta,
+        modelo_lineal_eta,
+        prediccion_base_eta,
+        prediccion_lineal_eta,
+        preprocesamiento_eta,
+        resultados_modelos_eta,
+    )
+
+
+@app.cell
+def _(
+    X_prueba_eta,
+    mo,
+    pd,
+    prediccion_lineal_eta,
+    y_prueba_eta,
+):
+    comparacion_predicciones_eta = X_prueba_eta.reset_index(drop=True).copy()
+    comparacion_predicciones_eta["real_min"] = y_prueba_eta.reset_index(
+        drop=True
+    )
+    comparacion_predicciones_eta["prediccion_min"] = pd.Series(
+        prediccion_lineal_eta
+    )
+    comparacion_predicciones_eta["error_abs_min"] = (
+        comparacion_predicciones_eta["real_min"]
+        - comparacion_predicciones_eta["prediccion_min"]
+    ).abs()
+
+    mo.ui.table(
+        comparacion_predicciones_eta.head(20).round(3),
+        selection=None,
+    )
+    return (comparacion_predicciones_eta,)
+
+
 if __name__ == "__main__":
     app.run()

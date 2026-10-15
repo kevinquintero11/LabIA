@@ -1,0 +1,30 @@
+[
+  {
+    "fecha": {
+      "$date": "2026-06-05T11:52:04.000Z"
+    },
+    "flotaID": "VEH_e3d5866f0c",
+    "evento": "Reporte GPS Programado",
+    "location": {
+      "coordinates": [
+        -69.13759,
+        -37.71386
+      ]
+    },
+    "velocidad": 0
+  },
+  {
+    "fecha": {
+      "$date": "2026-06-05T11:52:04.000Z"
+    },
+    "flotaID": "VEH_e3d5866f0c",
+    "evento": "Reporte GPS Programado",
+    "location": {
+      "coordinates": [
+        -69.13759,
+        -37.71386
+      ]
+    },
+    "velocidad": 0
+  }
+]

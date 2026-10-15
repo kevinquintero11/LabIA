@@ -1,0 +1,22 @@
+[
+  {
+    "nodo_origen": 13698144984,
+    "nodo_destino": 5864322509,
+    "franja_horaria": "Viernes_19_20",
+    "tiempo_real": 120.5,
+    "fecha": {
+      "$date": "2026-06-05T22:07:05.000Z"
+    },
+    "flotaID": "VEH_e3d5866f0c"
+  },
+  {
+    "nodo_origen": 11444818102,
+    "nodo_destino": 11444818103,
+    "franja_horaria": "Viernes_19_20",
+    "tiempo_real": 0.7,
+    "fecha": {
+      "$date": "2026-06-05T22:07:05.000Z"
+    },
+    "flotaID": "VEH_e3d5866f0c"
+  }
+]

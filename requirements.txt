@@ -2,3 +2,4 @@ marimo
 ijson
 pandas
 scikit-learn
+psycopg2

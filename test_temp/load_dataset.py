@@ -15,6 +15,22 @@ from psycopg2.extras import execute_values
 # CONFIGURACIÓN DINÁMICA DEL ESQUEMA BASADA EN LOS ESQUEMAS REALES
 # ==============================================================================
 TABLAS_CONFIG = {
+    "vehiculos": {
+        "columnas": {
+            "idvehiculo": "TEXT PRIMARY KEY",
+            "tipo_vehiculo": "TEXT",
+            "cant_plazas": "INT",
+        },
+        "indices": [],
+    },
+    "nodos": {
+        "columnas": {
+            "idnodo": "TEXT PRIMARY KEY",
+            "latitud": "DOUBLE PRECISION",
+            "longitud": "DOUBLE PRECISION",
+        },
+        "indices": [],
+    },
     "hojas": {
         "columnas": {
             "hoja_n": "BIGSERIAL PRIMARY KEY",
@@ -101,7 +117,10 @@ TABLAS_CONFIG = {
             "fuente": "TEXT",
         },
         "pk": "PRIMARY KEY (recorrido_id, orden)",
-        "indices": ["CREATE INDEX IF NOT EXISTS ix_segmentos_nodos ON segmentos(recorrido_id, origen, destino);"]
+        "indices": [
+            "CREATE INDEX IF NOT EXISTS ix_segmentos_nodos ON segmentos(recorrido_id, origen, destino);",
+            "CREATE INDEX IF NOT EXISTS ix_segmentos_par ON segmentos(origen, destino);",
+        ]
     },
     "gps": {
         "columnas": {
@@ -187,6 +206,13 @@ def _texto(valor) -> str | None:
     return valor if isinstance(valor, str) else None
 
 
+def _coordenadas_punto(punto) -> tuple[float | None, float | None]:
+    # OSRM "puntos" viene como [latitud, longitud]
+    if isinstance(punto, list) and len(punto) >= 2:
+        return _numero(punto[0]), _numero(punto[1])
+    return None, None
+
+
 def _fecha_utc(valor) -> str | None:
     if isinstance(valor, dict):
         valor = valor.get("$date")
@@ -257,11 +283,64 @@ def insert_bulk_returning_dinamico(cursor, tabla: str, registros: list[dict], ca
     return execute_values(cursor, sql, filas, fetch=True)
 
 
+RUTA_CSV_POR_DEFECTO = Path(__file__).resolve().parents[1] / "data" / "procesados" / "dataset_entrenamiento.csv"
+
+# Tabla única: una fila por observación real, enriquecida con vehículo, nodos y hojaruta.
+# Match Hojaruta estricto: mismo vehículo, fecha dentro de la ventana y el par (origen, destino)
+# presente en algún recorrido de la hoja; si hay varias candidatas gana la ventana más corta.
+SQL_DATASET_ENTRENAMIENTO = """
+CREATE TABLE dataset_entrenamiento AS
+SELECT
+    o.flota_id                              AS idvehiculo,
+    v.tipo_vehiculo                         AS tipovehiculo,
+    v.cant_plazas                           AS cantplazas,
+    (o.fecha_utc AT TIME ZONE 'UTC')::date  AS dia,
+    o.fecha_utc                             AS fecha_utc,
+    o.franja_horaria                        AS franjahoraria,
+    o.nodo_origen                           AS idnodoorigen,
+    nodo_o.latitud                          AS lat_origen,
+    nodo_o.longitud                         AS lon_origen,
+    o.nodo_destino                          AS idnododestino,
+    nodo_d.latitud                          AS lat_destino,
+    nodo_d.longitud                         AS lon_destino,
+    o.tiempo_real_seg                       AS tiemporeal,
+    hr.fecha_desde_utc                      AS fechadesde,
+    hr.fecha_hasta_utc                      AS fechahasta,
+    hr.duracion_osrm_original               AS duracion_osrm_original,
+    hr.recorrido_id                         AS ref_recorrido,
+    hr.variante                             AS variante
+FROM observaciones AS o
+LEFT JOIN vehiculos AS v ON v.idvehiculo = o.flota_id
+LEFT JOIN nodos AS nodo_o ON nodo_o.idnodo = o.nodo_origen
+LEFT JOIN nodos AS nodo_d ON nodo_d.idnodo = o.nodo_destino
+LEFT JOIN LATERAL (
+    SELECT h.fecha_desde_utc, h.fecha_hasta_utc,
+           r.recorrido_id, r.variante, r.duracion_osrm_original
+    FROM hojas AS h
+    JOIN recorridos AS r ON r.hoja_n = h.hoja_n
+    WHERE h.flota_id = o.flota_id
+      AND o.fecha_utc BETWEEN h.fecha_desde_utc AND h.fecha_hasta_utc
+      AND EXISTS (
+          SELECT 1
+          FROM segmentos AS s
+          WHERE s.recorrido_id = r.recorrido_id
+            AND s.origen = o.nodo_origen
+            AND s.destino = o.nodo_destino
+      )
+    ORDER BY h.fecha_hasta_utc - h.fecha_desde_utc ASC, r.recorrido_id
+    LIMIT 1
+) AS hr ON TRUE
+WHERE o.campos_minimos_ok = 1
+  AND o.tiempo_real_seg > 0;
+"""
+
+
 def importar_dataset_postgres(
     archivos: Mapping[str, Path | str],
     db_uri: str,
     lote: int = 25000,
     log: Callable[[str], None] = print,
+    csv_salida: Path | str | None = None,
 ) -> dict:
     conn = psycopg2.connect(db_uri)
     conn.autocommit = False
@@ -285,6 +364,24 @@ def importar_dataset_postgres(
     def _flush_hojas():
         if not lote_hojas:
             return
+
+        # Vehiculos (el primer valor visto por vehículo gana: ON CONFLICT DO NOTHING)
+        vehiculos_lote = {}
+        for reg in lote_hojas:
+            if reg["flota_id"] is not None:
+                vehiculos_lote.setdefault(
+                    reg["flota_id"],
+                    (reg["flota_id"], reg["tipo_vehiculo"], reg["cantidad_plazas"]),
+                )
+        if vehiculos_lote:
+            execute_values(
+                cursor,
+                "INSERT INTO vehiculos (idvehiculo, tipo_vehiculo, cant_plazas) VALUES %s "
+                "ON CONFLICT (idvehiculo) DO NOTHING",
+                list(vehiculos_lote.values()),
+            )
+
+        nodos_lote = {}
 
         n_hojas = len(lote_hojas)
         log(f" ─► [BATCH HOJAS] Insertando {n_hojas:,} hojas de ruta...")
@@ -360,6 +457,30 @@ def importar_dataset_postgres(
                         "distancia_osrm": _numero(var_obj.get("distancia_osrm")),
                     })
                     docs_recorridos_buffer.append(segmentos)
+
+                    # Nodos: origen de seg[i] -> puntos[i]; destino de seg[i] -> puntos[i+1]
+                    puntos = var_obj.get("puntos") if isinstance(var_obj.get("puntos"), list) else []
+                    if len(puntos) == len(segmentos) + 1:
+                        for i, seg in enumerate(segmentos):
+                            if not isinstance(seg, dict):
+                                continue
+                            pares_nodo = (
+                                (seg.get("origen"), puntos[i]),
+                                (seg.get("destino"), puntos[i + 1]),
+                            )
+                            for clave_nodo, punto in pares_nodo:
+                                idnodo = _identificador(clave_nodo)
+                                lat, lon = _coordenadas_punto(punto)
+                                if idnodo and lat is not None and lon is not None:
+                                    nodos_lote.setdefault(idnodo, (idnodo, lat, lon))
+
+        if nodos_lote:
+            execute_values(
+                cursor,
+                "INSERT INTO nodos (idnodo, latitud, longitud) VALUES %s "
+                "ON CONFLICT (idnodo) DO NOTHING",
+                list(nodos_lote.values()),
+            )
 
         # Inserciones asociadas en batch
         if filas_pasajeros:
@@ -511,10 +632,37 @@ def importar_dataset_postgres(
     conn.commit()
     log("✔ Índices creados exitosamente.")
 
+    # 5. Tabla única de entrenamiento (una fila por observación real)
+    log("\nConstruyendo tabla única dataset_entrenamiento...")
+    cursor.execute("DROP TABLE IF EXISTS dataset_entrenamiento;")
+    cursor.execute(SQL_DATASET_ENTRENAMIENTO)
+    cursor.execute("CREATE INDEX IF NOT EXISTS ix_dataset_vehiculo_dia ON dataset_entrenamiento(idvehiculo, dia);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS ix_dataset_segmento ON dataset_entrenamiento(idnodoorigen, idnododestino);")
+    conn.commit()
+
+    for tabla in ("vehiculos", "nodos", "dataset_entrenamiento"):
+        cursor.execute(f"SELECT count(*) FROM {tabla};")
+        contadores[tabla] = cursor.fetchone()[0]
+    log(f"✔ dataset_entrenamiento creada. Filas: {contadores['dataset_entrenamiento']:,}")
+
+    # 6. Exportación a CSV para entrenamiento
+    ruta_csv = Path(csv_salida) if csv_salida else RUTA_CSV_POR_DEFECTO
+    ruta_csv.parent.mkdir(parents=True, exist_ok=True)
+    log(f"Exportando CSV a {ruta_csv} ...")
+    with ruta_csv.open("w", encoding="utf-8", newline="") as salida:
+        cursor.copy_expert(
+            "COPY (SELECT * FROM dataset_entrenamiento ORDER BY idvehiculo, fecha_utc) "
+            "TO STDOUT WITH (FORMAT csv, HEADER true, NULL '')",
+            salida,
+        )
+    log("✔ CSV exportado.")
+
     cursor.close()
     conn.close()
 
+    tablas_resumen = tuple(TABLAS_CONFIG.keys()) + ("dataset_entrenamiento",)
     return {
-        "tablas": [{"tabla": t, "filas": contadores[t]} for t in tablas],
+        "tablas": [{"tabla": t, "filas": contadores[t]} for t in tablas_resumen],
+        "csv": str(ruta_csv),
         "mensaje": "Importación completada con éxito en PostgreSQL",
     }

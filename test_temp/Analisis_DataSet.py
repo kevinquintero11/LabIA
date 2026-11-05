@@ -51,13 +51,14 @@ def _():
 @app.cell
 def _():
     import psycopg2
-    from dataset_up import importar_dataset_postgres
+    from load_dataset import importar_dataset_postgres
+    from driverdb import DB_URI
 
-    return importar_dataset_postgres, psycopg2
+    return DB_URI, importar_dataset_postgres, psycopg2
 
 
 @app.cell
-def _(Path, importar_dataset_postgres, mo, psycopg2):
+def _(DB_URI, Path, importar_dataset_postgres, mo, psycopg2):
     # 1. Rutas de archivos de origen
     PROYECTO = Path.cwd()
     ORIGINALES = PROYECTO / "data" / "originales"
@@ -68,10 +69,10 @@ def _(Path, importar_dataset_postgres, mo, psycopg2):
         "observaciones": ORIGINALES / "observacionesSegmentosViales.json",
     }
 
-    # 2. Credenciales de la base de datos PostgreSQL
-    POSTGRES_URI = "postgresql://admin:pase@localhost:5432/db_dataset"
+    # 2. Misma conexión y esquema eta_modelo que las consultas exploratorias.
+    POSTGRES_URI = DB_URI
 
-    # 3. Carga directa al evaluar la celda
+    # 3. Primera carga sobre una base/esquema vacío (ver README_modelo.md).
     resumen_importacion_pg = importar_dataset_postgres(
         archivos=ARCHIVOS_ETA,
         db_uri=POSTGRES_URI,
@@ -298,13 +299,13 @@ def _(mo):
           AND (%s::bigint IS NULL OR r.recorrido_id = %s)
           AND (%s::text IS NULL OR h.tipo_vehiculo = %s)
           AND EXISTS (
-              SELECT 1 FROM segmentos AS s
+              SELECT 1 FROM segmentos_detalle AS s
               WHERE s.recorrido_id = r.recorrido_id
           )
           AND (
               %s::bigint IS NOT NULL OR EXISTS (
                   SELECT 1
-                  FROM segmentos AS s
+                  FROM segmentos_detalle AS s
                   JOIN observaciones AS o
                     ON o.nodo_origen = s.origen
                    AND o.nodo_destino = s.destino
@@ -327,7 +328,7 @@ def _(mo):
            CASE WHEN COUNT(o.observacion_n) = 1
                 THEN MIN(o.tiempo_real_seg) END AS tiempo_unico_seg
     FROM elegido AS e
-    JOIN segmentos AS s ON s.recorrido_id = e.recorrido_id
+    JOIN segmentos_detalle AS s ON s.recorrido_id = e.recorrido_id
     LEFT JOIN observaciones AS o
       ON o.flota_id = e.flota_id
      AND o.nodo_origen = s.origen

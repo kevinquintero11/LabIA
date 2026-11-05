@@ -6,6 +6,11 @@ Proyecto académico para estimar la duración de un viaje al salir y actualizar 
 
 **Modalidad del equipo:** cada integrante tiene el código compartido, una copia local de los mismos tres JSON y su propia base SQLite. Los datos grandes no se suben al repositorio.
 
+**Rama `modelo` — PostgreSQL:** el importador normalizado, el dataset CSV y la
+notebook de `test_temp/` se explican en [Modelo de PostgreSQL](test_temp/README_modelo.md).
+Ese flujo requiere una base o esquema nuevo y vacío; las instrucciones SQLite de
+este documento corresponden al flujo de la raíz.
+
 
 ## Contenido
 

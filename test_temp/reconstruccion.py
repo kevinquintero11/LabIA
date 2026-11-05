@@ -173,7 +173,7 @@ def inspeccionar_recorrido(recorrido_id, limite_gps=10_000,
                            COUNT(o.fecha_utc) AS coincidencias,
                            MIN(o.fecha_utc) AS primera_fecha,
                            MAX(o.fecha_utc) AS ultima_fecha
-                    FROM segmentos s LEFT JOIN unicas o
+                    FROM segmentos_detalle s LEFT JOIN unicas o
                       ON o.nodo_origen = s.origen AND o.nodo_destino = s.destino
                     WHERE s.recorrido_id = %s
                     GROUP BY s.orden, s.origen, s.destino ORDER BY s.orden

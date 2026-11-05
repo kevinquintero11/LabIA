@@ -1,10 +1,15 @@
 import psycopg2
 from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
+from psycopg2.extensions import make_dsn
 from typing import Any, Sequence
 
 # Datos de conexión hardcodeados
 DB_URI = "postgresql://admin:pase@localhost:5432/db_dataset"
+
+# Todas las consultas del modelo usan el esquema nuevo, separado de public.
+DB_SCHEMA = "eta_modelo"
+DB_URI = make_dsn(DB_URI, options=f"-c search_path={DB_SCHEMA}")
 
 _conexion = None
 

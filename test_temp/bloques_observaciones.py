@@ -120,7 +120,7 @@ def inspeccionar_bloque(flota_id, fecha_utc, limite_observaciones=10_000,
                 raise ValueError("Demasiados recorridos candidatos; acotá las hojas antes de continuar.")
             cur.execute("""
                 SELECT recorrido_id, orden, origen, destino
-                FROM segmentos WHERE recorrido_id = ANY(%s)
+                FROM segmentos_detalle WHERE recorrido_id = ANY(%s)
                 ORDER BY recorrido_id, orden LIMIT %s
             """, ([r["recorrido_id"] for r in rutas], limite_segmentos + 1))
             segmentos = [dict(s) for s in cur.fetchall()]

@@ -36,7 +36,7 @@ TABLAS_CONFIG = {
             "hoja_n": "BIGSERIAL PRIMARY KEY",
             "hoja_id": "TEXT",
             "obra_id": "TEXT",
-            "flota_id": "TEXT",
+            "flota_id": "TEXT REFERENCES vehiculos(idvehiculo)",
             "tipo_vehiculo": "TEXT",
             "cantidad_plazas": "INT",
             "total_pasajeros": "INT",
@@ -82,18 +82,18 @@ TABLAS_CONFIG = {
         },
         "indices": ["CREATE INDEX IF NOT EXISTS ix_waypoints_hoja ON waypoints(hoja_n);"]
     },
-    "paradas": {
+    "paradas_importadas": {
         "columnas": {
             "parada_id": "BIGSERIAL PRIMARY KEY",
             "hoja_n": "BIGINT NOT NULL REFERENCES hojas(hoja_n) ON DELETE CASCADE",
             "sentido": "TEXT NOT NULL",
             "orden": "INT NOT NULL",
             "localidad": "TEXT",
-            "hora_utc": "TIMESTAMPTZ",
+            "hora_referencia": "TEXT",
             "longitud": "DOUBLE PRECISION",
             "latitud": "DOUBLE PRECISION",
         },
-        "indices": ["CREATE INDEX IF NOT EXISTS ix_paradas_hoja ON paradas(hoja_n);"]
+        "indices": ["CREATE INDEX IF NOT EXISTS ix_paradas_importadas_hoja ON paradas_importadas(hoja_n);"]
     },
     "recorridos": {
         "columnas": {
@@ -105,9 +105,10 @@ TABLAS_CONFIG = {
             "duracion_osrm_original": "DOUBLE PRECISION",
             "distancia_osrm": "DOUBLE PRECISION",
         },
-        "indices": ["CREATE INDEX IF NOT EXISTS ix_recorridos_hoja ON recorridos(hoja_n);"]
+        "indices": ["CREATE INDEX IF NOT EXISTS ix_recorridos_hoja ON recorridos(hoja_n);"],
+        "pk": "UNIQUE (hoja_n, variante)",
     },
-    "segmentos": {
+    "segmentos_importados": {
         "columnas": {
             "recorrido_id": "BIGINT NOT NULL REFERENCES recorridos(recorrido_id) ON DELETE CASCADE",
             "orden": "INT NOT NULL",
@@ -118,8 +119,7 @@ TABLAS_CONFIG = {
         },
         "pk": "PRIMARY KEY (recorrido_id, orden)",
         "indices": [
-            "CREATE INDEX IF NOT EXISTS ix_segmentos_nodos ON segmentos(recorrido_id, origen, destino);",
-            "CREATE INDEX IF NOT EXISTS ix_segmentos_par ON segmentos(origen, destino);",
+            "CREATE INDEX IF NOT EXISTS ix_segmentos_importados_par ON segmentos_importados(origen, destino);",
         ]
     },
     "gps": {
@@ -135,7 +135,7 @@ TABLAS_CONFIG = {
         },
         "indices": ["CREATE INDEX IF NOT EXISTS ix_gps_vehiculo_fecha ON gps(flota_id, fecha_utc);"]
     },
-    "observaciones": {
+    "observaciones_importadas": {
         "columnas": {
             "observacion_n": "BIGSERIAL PRIMARY KEY",
             "flota_id": "TEXT",
@@ -146,8 +146,58 @@ TABLAS_CONFIG = {
             "tiempo_real_seg": "DOUBLE PRECISION",
             "campos_minimos_ok": "INT NOT NULL",
         },
-        "indices": ["CREATE INDEX IF NOT EXISTS ix_obs_vehiculo_fecha ON observaciones(flota_id, fecha_utc);"]
-    }
+        "indices": [],
+    },
+    "segmentos": {
+        "columnas": {
+            "idsegmento": "BIGSERIAL PRIMARY KEY",
+            "idnodoorigen": "TEXT NOT NULL REFERENCES nodos(idnodo)",
+            "idnododestino": "TEXT NOT NULL REFERENCES nodos(idnodo)",
+        },
+        "pk": "UNIQUE (idnodoorigen, idnododestino)",
+        "indices": [],
+    },
+    "recorrido_segmentos": {
+        "columnas": {
+            "recorrido_id": "BIGINT NOT NULL REFERENCES recorridos(recorrido_id)",
+            "orden": "INT NOT NULL",
+            "idsegmento": "BIGINT NOT NULL REFERENCES segmentos(idsegmento)",
+            "tiempo_estimado": "DOUBLE PRECISION",
+            "fuente": "TEXT",
+        },
+        "pk": "PRIMARY KEY (recorrido_id, orden)",
+        "indices": ["CREATE INDEX IF NOT EXISTS ix_recorrido_segmento ON recorrido_segmentos(idsegmento, recorrido_id);"],
+    },
+    "observaciones_segmento": {
+        "columnas": {
+            "idobservacion": "BIGINT PRIMARY KEY REFERENCES observaciones_importadas(observacion_n)",
+            "idsegmento": "BIGINT NOT NULL REFERENCES segmentos(idsegmento)",
+            "idvehiculo": "TEXT NOT NULL REFERENCES vehiculos(idvehiculo)",
+            "fecha_utc": "TIMESTAMPTZ NOT NULL",
+            "franja_horaria": "TEXT",
+            "tiempo_real_seg": "DOUBLE PRECISION NOT NULL CHECK (tiempo_real_seg > 0)",
+        },
+        "indices": ["CREATE INDEX IF NOT EXISTS ix_obs_segmento_vehiculo_fecha ON observaciones_segmento(idvehiculo, fecha_utc);"],
+    },
+    "paradas": {
+        "columnas": {
+            "idparada": "BIGINT PRIMARY KEY REFERENCES paradas_importadas(parada_id)",
+            "latitud": "DOUBLE PRECISION",
+            "longitud": "DOUBLE PRECISION",
+            "localidad": "TEXT",
+        },
+        "indices": [],
+    },
+    "recorrido_paradas": {
+        "columnas": {
+            "recorrido_id": "BIGINT NOT NULL REFERENCES recorridos(recorrido_id)",
+            "orden": "INT NOT NULL",
+            "idparada": "BIGINT NOT NULL REFERENCES paradas(idparada)",
+            "hora_referencia": "TEXT",
+        },
+        "pk": "PRIMARY KEY (recorrido_id, orden)",
+        "indices": [],
+    },
 }
 
 
@@ -285,22 +335,83 @@ def insert_bulk_returning_dinamico(cursor, tabla: str, registros: list[dict], ca
 
 RUTA_CSV_POR_DEFECTO = Path(__file__).resolve().parents[1] / "data" / "procesados" / "dataset_entrenamiento.csv"
 
-# Tabla única: una fila por observación real, enriquecida con vehículo, nodos y hojaruta.
-# Match Hojaruta estricto: mismo vehículo, fecha dentro de la ventana y el par (origen, destino)
-# presente en algún recorrido de la hoja; si hay varias candidatas gana la ventana más corta.
+# Se conservan las filas importadas, incluso las inválidas. Las tablas normalizadas
+# contienen solo las relaciones resolubles; los nodos sin geometría quedan sin coordenadas.
+SQL_NORMALIZAR = """
+INSERT INTO vehiculos (idvehiculo)
+SELECT flota_id FROM observaciones_importadas WHERE flota_id IS NOT NULL
+UNION SELECT flota_id FROM gps WHERE flota_id IS NOT NULL
+ON CONFLICT DO NOTHING;
+
+INSERT INTO nodos (idnodo)
+SELECT origen FROM segmentos_importados WHERE origen IS NOT NULL
+UNION SELECT destino FROM segmentos_importados WHERE destino IS NOT NULL
+UNION SELECT nodo_origen FROM observaciones_importadas WHERE nodo_origen IS NOT NULL
+UNION SELECT nodo_destino FROM observaciones_importadas WHERE nodo_destino IS NOT NULL
+ON CONFLICT DO NOTHING;
+
+INSERT INTO segmentos (idnodoorigen, idnododestino)
+SELECT origen, destino FROM segmentos_importados
+WHERE origen IS NOT NULL AND destino IS NOT NULL
+UNION
+SELECT nodo_origen, nodo_destino FROM observaciones_importadas
+WHERE nodo_origen IS NOT NULL AND nodo_destino IS NOT NULL;
+
+INSERT INTO recorrido_segmentos
+    (recorrido_id, orden, idsegmento, tiempo_estimado, fuente)
+SELECT i.recorrido_id, i.orden, s.idsegmento, i.tiempo_estimado, i.fuente
+FROM segmentos_importados i
+JOIN segmentos s ON s.idnodoorigen = i.origen AND s.idnododestino = i.destino;
+
+INSERT INTO observaciones_segmento
+    (idobservacion, idsegmento, idvehiculo, fecha_utc, franja_horaria, tiempo_real_seg)
+SELECT o.observacion_n, s.idsegmento, o.flota_id, o.fecha_utc,
+       o.franja_horaria, o.tiempo_real_seg
+FROM observaciones_importadas o
+JOIN segmentos s ON s.idnodoorigen = o.nodo_origen AND s.idnododestino = o.nodo_destino
+WHERE o.campos_minimos_ok = 1 AND o.tiempo_real_seg > 0;
+
+-- Sin identidad de parada en la fuente, no se infiere equivalencia por cercanía.
+INSERT INTO paradas (idparada, latitud, longitud, localidad)
+SELECT parada_id, latitud, longitud, localidad FROM paradas_importadas;
+
+INSERT INTO recorrido_paradas (recorrido_id, orden, idparada, hora_referencia)
+SELECT r.recorrido_id, p.orden, p.parada_id, p.hora_referencia
+FROM paradas_importadas p
+JOIN recorridos r ON r.hoja_n = p.hoja_n AND r.variante = p.sentido;
+
+-- Vistas para la exploración existente, sin duplicar los datos normalizados.
+CREATE OR REPLACE VIEW segmentos_detalle AS
+SELECT rs.recorrido_id, rs.orden, s.idnodoorigen AS origen,
+       s.idnododestino AS destino, rs.tiempo_estimado, rs.fuente, s.idsegmento
+FROM recorrido_segmentos rs JOIN segmentos s USING (idsegmento);
+
+CREATE OR REPLACE VIEW observaciones AS
+SELECT o.idobservacion AS observacion_n, o.idvehiculo AS flota_id, o.fecha_utc,
+       s.idnodoorigen AS nodo_origen, s.idnododestino AS nodo_destino,
+       o.franja_horaria, o.tiempo_real_seg, 1 AS campos_minimos_ok
+FROM observaciones_segmento o JOIN segmentos s USING (idsegmento);
+"""
+
+# Una fila por observación válida. Solo se adjunta un recorrido si la candidatura
+# es única: coincidir en vehículo/ventana/tramo no demuestra una ejecución real.
 SQL_DATASET_ENTRENAMIENTO = """
 CREATE TABLE dataset_entrenamiento AS
 SELECT
-    o.flota_id                              AS idvehiculo,
+    o.idobservacion,
+    o.idsegmento,
+    o.idvehiculo,
     v.tipo_vehiculo                         AS tipovehiculo,
     v.cant_plazas                           AS cantplazas,
-    (o.fecha_utc AT TIME ZONE 'UTC')::date  AS dia,
+    (o.fecha_utc AT TIME ZONE 'America/Argentina/Buenos_Aires')::date AS dia,
+    (o.fecha_utc AT TIME ZONE 'America/Argentina/Buenos_Aires')::time AS hora_local,
+    EXTRACT(ISODOW FROM o.fecha_utc AT TIME ZONE 'America/Argentina/Buenos_Aires')::int AS dia_semana,
     o.fecha_utc                             AS fecha_utc,
     o.franja_horaria                        AS franjahoraria,
-    o.nodo_origen                           AS idnodoorigen,
+    s.idnodoorigen,
     nodo_o.latitud                          AS lat_origen,
     nodo_o.longitud                         AS lon_origen,
-    o.nodo_destino                          AS idnododestino,
+    s.idnododestino,
     nodo_d.latitud                          AS lat_destino,
     nodo_d.longitud                         AS lon_destino,
     o.tiempo_real_seg                       AS tiemporeal,
@@ -308,30 +419,36 @@ SELECT
     hr.fecha_hasta_utc                      AS fechahasta,
     hr.duracion_osrm_original               AS duracion_osrm_original,
     hr.recorrido_id                         AS ref_recorrido,
-    hr.variante                             AS variante
-FROM observaciones AS o
-LEFT JOIN vehiculos AS v ON v.idvehiculo = o.flota_id
-LEFT JOIN nodos AS nodo_o ON nodo_o.idnodo = o.nodo_origen
-LEFT JOIN nodos AS nodo_d ON nodo_d.idnodo = o.nodo_destino
+    hr.variante                             AS variante,
+    COALESCE(hr.candidatos, 0)              AS recorridos_candidatos,
+    CASE WHEN hr.candidatos = 1 THEN 'unico_no_validado'
+         WHEN hr.candidatos > 1 THEN 'ambiguo'
+         ELSE 'sin_coincidencia' END        AS estado_asociacion
+FROM observaciones_segmento AS o
+JOIN segmentos s USING (idsegmento)
+JOIN vehiculos AS v ON v.idvehiculo = o.idvehiculo
+JOIN nodos AS nodo_o ON nodo_o.idnodo = s.idnodoorigen
+JOIN nodos AS nodo_d ON nodo_d.idnodo = s.idnododestino
 LEFT JOIN LATERAL (
-    SELECT h.fecha_desde_utc, h.fecha_hasta_utc,
-           r.recorrido_id, r.variante, r.duracion_osrm_original
-    FROM hojas AS h
-    JOIN recorridos AS r ON r.hoja_n = h.hoja_n
-    WHERE h.flota_id = o.flota_id
-      AND o.fecha_utc BETWEEN h.fecha_desde_utc AND h.fecha_hasta_utc
-      AND EXISTS (
-          SELECT 1
-          FROM segmentos AS s
-          WHERE s.recorrido_id = r.recorrido_id
-            AND s.origen = o.nodo_origen
-            AND s.destino = o.nodo_destino
-      )
-    ORDER BY h.fecha_hasta_utc - h.fecha_desde_utc ASC, r.recorrido_id
-    LIMIT 1
-) AS hr ON TRUE
-WHERE o.campos_minimos_ok = 1
-  AND o.tiempo_real_seg > 0;
+    SELECT COUNT(*) AS candidatos,
+           CASE WHEN COUNT(*) = 1 THEN MIN(c.fecha_desde_utc) END AS fecha_desde_utc,
+           CASE WHEN COUNT(*) = 1 THEN MIN(c.fecha_hasta_utc) END AS fecha_hasta_utc,
+           CASE WHEN COUNT(*) = 1 THEN MIN(c.recorrido_id) END AS recorrido_id,
+           CASE WHEN COUNT(*) = 1 THEN MIN(c.variante) END AS variante,
+           CASE WHEN COUNT(*) = 1 THEN MIN(c.duracion_osrm_original) END AS duracion_osrm_original
+    FROM (
+        SELECT h.fecha_desde_utc, h.fecha_hasta_utc,
+               r.recorrido_id, r.variante, r.duracion_osrm_original
+        FROM hojas AS h
+        JOIN recorridos AS r ON r.hoja_n = h.hoja_n
+        WHERE h.flota_id = o.idvehiculo
+          AND o.fecha_utc BETWEEN h.fecha_desde_utc AND h.fecha_hasta_utc
+          AND EXISTS (
+              SELECT 1 FROM recorrido_segmentos rs
+              WHERE rs.recorrido_id = r.recorrido_id AND rs.idsegmento = o.idsegmento
+          )
+    ) c
+) AS hr ON TRUE;
 """
 
 
@@ -342,11 +459,34 @@ def importar_dataset_postgres(
     log: Callable[[str], None] = print,
     csv_salida: Path | str | None = None,
 ) -> dict:
+    """Importa una entrega sobre un esquema vacío; nunca borra una base existente."""
+    if lote <= 0:
+        raise ValueError("lote debe ser mayor que cero")
+    rutas = {k: Path(archivos[k]) for k in ("hojas", "gps", "observaciones")}
+    for ruta in rutas.values():
+        if not ruta.is_file():
+            raise FileNotFoundError(ruta)
     conn = psycopg2.connect(db_uri)
+    try:
+        return _importar_dataset_postgres(conn, rutas, lote, log, csv_salida)
+    finally:
+        # También libera recursos y revierte el lote pendiente si falla la carga.
+        conn.close()
+
+
+def _importar_dataset_postgres(conn, archivos, lote, log, csv_salida):
     conn.autocommit = False
     cursor = conn.cursor()
 
-    cursor.execute("SET LOCAL synchronous_commit = off;")
+    # El cambio de estructura requiere una base/esquema vacío. No se migra ni
+    # trunca silenciosamente una entrega anterior o una importación incompleta.
+    for tabla in (*TABLAS_CONFIG, "dataset_entrenamiento", "observaciones", "segmentos_detalle"):
+        cursor.execute("SELECT to_regclass(%s)", (tabla,))
+        if cursor.fetchone()[0] is not None:
+            raise ValueError(
+                f"El esquema ya contiene {tabla}. Usá una base o esquema vacío "
+                "para importar el modelo normalizado; la base anterior se conserva."
+            )
 
     log("Creando esquemas de tablas dinámicamente según esquemas reales...")
     cursor.execute(generar_ddl_tablas(TABLAS_CONFIG))
@@ -437,7 +577,7 @@ def importar_dataset_postgres(
                             "sentido": sentido,
                             "orden": item.get("orden", 0),
                             "localidad": _texto(item.get("localidad")),
-                            "hora_utc": _fecha_utc(item.get("hora")),
+                            "hora_referencia": _texto(item.get("hora")),
                             "latitud": _numero(coords.get("latitud")),
                             "longitud": _numero(coords.get("longitud")),
                         })
@@ -445,8 +585,11 @@ def importar_dataset_postgres(
             # D. Geometria OSRM (Recorridos y Segmentos)
             geo_osrm = doc.get("geometriaOSRM") if isinstance(doc.get("geometriaOSRM"), dict) else {}
             for variante in ("ida", "vuelta", "alternativa"):
-                var_obj = geo_osrm.get(variante) if isinstance(geo_osrm.get(variante), dict) else None
-                if var_obj:
+                var_obj = geo_osrm.get(variante) if isinstance(geo_osrm.get(variante), dict) else {}
+                paradas_variante = doc.get(f"paradas{variante.capitalize()}")
+                waypoints_variante = doc.get(f"waypoints{variante.capitalize()}")
+                # Una variante puede tener paradas aunque aún no tenga geometría.
+                if var_obj or paradas_variante or waypoints_variante:
                     segmentos = var_obj.get("analitica_segmentos") if isinstance(var_obj.get("analitica_segmentos"), list) else []
                     lote_recorridos.append({
                         "hoja_n": hoja_n,
@@ -495,8 +638,8 @@ def importar_dataset_postgres(
 
         if filas_paradas:
             log(f"    ├─► [COPY PARADAS] Insertando {len(filas_paradas):,} paradas...")
-            copy_bulk_dinamico(cursor, "paradas", filas_paradas)
-            contadores["paradas"] += len(filas_paradas)
+            copy_bulk_dinamico(cursor, "paradas_importadas", filas_paradas)
+            contadores["paradas_importadas"] += len(filas_paradas)
 
         if lote_recorridos:
             log(f"    ├─► [BATCH RECORRIDOS] Insertando {len(lote_recorridos):,} recorridos...")
@@ -517,8 +660,8 @@ def importar_dataset_postgres(
 
             if filas_segmentos:
                 log(f"    └─► [COPY SEGMENTOS] Insertando {len(filas_segmentos):,} segmentos...")
-                copy_bulk_dinamico(cursor, "segmentos", filas_segmentos)
-                contadores["segmentos"] += len(filas_segmentos)
+                copy_bulk_dinamico(cursor, "segmentos_importados", filas_segmentos)
+                contadores["segmentos_importados"] += len(filas_segmentos)
 
             contadores["recorridos"] += len(lote_recorridos)
 
@@ -550,7 +693,9 @@ def importar_dataset_postgres(
         })
         docs_hojas_buffer.append(doc)
 
-        if len(lote_hojas) >= 2000:
+        # Las hojas incluyen geometrías extensas y estructuras decimales: limitar
+        # su lote por separado evita acumular miles de documentos en memoria.
+        if len(lote_hojas) >= min(lote, 100):
             _flush_hojas()
             conn.commit()
             log(f"  [PROGRESO HOJAS] Leídas {vistos_hojas:,} hojas de ruta...")
@@ -612,35 +757,43 @@ def importar_dataset_postgres(
             "tiempo_real_seg": segundos,
             "campos_minimos_ok": int(ok),
         })
-        contadores["observaciones"] += 1
+        contadores["observaciones_importadas"] += 1
 
         if len(pendientes_obs) >= lote:
             log(f" ─► [COPY OBS] Insertando lote de {len(pendientes_obs):,} observaciones (Total leídas: {vistos:,})...")
-            copy_bulk_dinamico(cursor, "observaciones", pendientes_obs)
+            copy_bulk_dinamico(cursor, "observaciones_importadas", pendientes_obs)
             conn.commit()
             pendientes_obs.clear()
 
     if pendientes_obs:
         log(f" ─► [COPY OBS] Insertando último lote de {len(pendientes_obs):,} observaciones...")
-        copy_bulk_dinamico(cursor, "observaciones", pendientes_obs)
+        copy_bulk_dinamico(cursor, "observaciones_importadas", pendientes_obs)
         conn.commit()
-    log(f"✔ Observaciones finalizadas. Total observaciones: {contadores['observaciones']:,}")
+    log(f"✔ Observaciones finalizadas. Total observaciones: {contadores['observaciones_importadas']:,}")
+
+    log("\nNormalizando segmentos, observaciones y paradas...")
+    cursor.execute(SQL_NORMALIZAR)
+    conn.commit()
 
     # 4. Creación final de Índices
     log("\nConstruyendo índices relacionales finales...")
     cursor.execute(generar_ddl_indices(TABLAS_CONFIG))
+    # El dataset hace búsquedas correlacionadas sobre tablas recién cargadas.
+    # Actualizar estadísticas antes de planificarlas, sin esperar al autovacuum.
+    for tabla in ("hojas", "recorridos", "recorrido_segmentos", "observaciones_segmento"):
+        cursor.execute(f"ANALYZE {tabla};")
     conn.commit()
     log("✔ Índices creados exitosamente.")
 
     # 5. Tabla única de entrenamiento (una fila por observación real)
     log("\nConstruyendo tabla única dataset_entrenamiento...")
-    cursor.execute("DROP TABLE IF EXISTS dataset_entrenamiento;")
     cursor.execute(SQL_DATASET_ENTRENAMIENTO)
+    cursor.execute("ALTER TABLE dataset_entrenamiento ADD PRIMARY KEY (idobservacion);")
     cursor.execute("CREATE INDEX IF NOT EXISTS ix_dataset_vehiculo_dia ON dataset_entrenamiento(idvehiculo, dia);")
     cursor.execute("CREATE INDEX IF NOT EXISTS ix_dataset_segmento ON dataset_entrenamiento(idnodoorigen, idnododestino);")
     conn.commit()
 
-    for tabla in ("vehiculos", "nodos", "dataset_entrenamiento"):
+    for tabla in (*TABLAS_CONFIG, "dataset_entrenamiento"):
         cursor.execute(f"SELECT count(*) FROM {tabla};")
         contadores[tabla] = cursor.fetchone()[0]
     log(f"✔ dataset_entrenamiento creada. Filas: {contadores['dataset_entrenamiento']:,}")
@@ -664,5 +817,10 @@ def importar_dataset_postgres(
     return {
         "tablas": [{"tabla": t, "filas": contadores[t]} for t in tablas_resumen],
         "csv": str(ruta_csv),
+        "advertencias": [
+            "tiemporeal conserva el valor original; no se confirmó si incluye detenciones de pasajeros.",
+            "Las asociaciones a recorridos son candidaturas, no viajes validados.",
+            "Las paradas sin ID de origen se conservan por registro, sin deduplicación espacial.",
+        ],
         "mensaje": "Importación completada con éxito en PostgreSQL",
     }

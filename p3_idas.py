@@ -1294,6 +1294,17 @@ def _(
     timedelta,
     zlib,
 ):
+    def filtrar_particion_p3(lf, primer_dia_test, split):
+        """Partición por viaje completo; purga viajes que cruzan el corte."""
+        if split not in ("train", "test"):
+            raise ValueError("split debe ser 'train' o 'test'")
+        corte = datetime.fromisoformat(str(primer_dia_test)).date()
+        salida = pl.col("salida_recorrido_utc").dt.date()
+        llegada = pl.col("llegada_recorrido_utc").dt.date()
+        if split == "train":
+            return lf.filter((salida < corte) & (llegada < corte))
+        return lf.filter(salida >= corte)
+
     def armar_dataset_p3_streaming(
         hdr_path: Path | str,
         gps_path: Path | str,
@@ -1316,11 +1327,17 @@ def _(
         """
         Construye el dataset de p3_idas por fragmentos Parquet sin cargar el GPS ni
         la tabla final completa en memoria RAM.
+
+        Los segmentos se ubican por orden, no por el valor de sus IDs de nodos.
+        El split usa la salida del viaje completo. Los viajes que atraviesan el
+        corte se excluyen de ambos conjuntos, también al leerlos con TensorFlow.
         """
         if nivel not in ("segmento", "viaje"):
             raise ValueError("nivel debe ser 'segmento' o 'viaje'")
         if objetivo not in ("y_en_viaje_minutos", "y_al_salir_minutos"):
             raise ValueError("objetivo debe ser 'y_en_viaje_minutos' o 'y_al_salir_minutos'")
+        if not 0 < proporcion_train < 1:
+            raise ValueError("proporcion_train debe estar entre 0 y 1, sin incluirlos")
         if nivel == "viaje" and objetivo == "y_en_viaje_minutos":
             objetivo = "y_al_salir_minutos"
 
@@ -1341,6 +1358,9 @@ def _(
             "idhojaruta": pl.String,
             "idvehiculo": pl.String,
             "total_segmentos": pl.Int32,
+            # Constantes para todas las filas del viaje; no son features.
+            "salida_recorrido_utc": pl.Datetime("us", "UTC"),
+            "llegada_recorrido_utc": pl.Datetime("us", "UTC"),
             "instant_t_fechahora": pl.Datetime("us", "UTC"),
             "t_franjahoraria": pl.String,
             "t_dia_semana": pl.Int8,
@@ -1420,6 +1440,28 @@ def _(
                     out.append((lat, lon))
             return out
 
+        def segmentos_por_orden(analitica, n_orig, id_hdr, variante):
+            """El segmento i corresponde al par de vértices i → i+1.
+
+            Los nodos origen/destino son IDs, nunca índices. Sin una lista
+            alineada no se puede deducir la ubicación de un nodo por su número.
+            """
+            if analitica and len(analitica) != n_orig - 1:
+                raise ValueError(
+                    f"Hoja {id_hdr}, {variante}: {len(analitica)} segmentos para "
+                    f"{n_orig} vértices; no hay correspondencia uno a uno. "
+                    "Revisar la geometría antes de generar filas por segmento."
+                )
+            salida = []
+            for i in range(n_orig - 1):
+                s = analitica[i] if analitica else {}
+                if isinstance(s, dict) and s.get("origen") is not None and s.get("destino") is not None:
+                    id_segmento = f"{s['origen']}_{s['destino']}"
+                else:
+                    id_segmento = f"vertice_{i}_{i + 1}"
+                salida.append((id_segmento, i))
+            return salida
+
         def con_busqueda(poly):
             if len(poly) < 2:
                 return []
@@ -1497,11 +1539,16 @@ def _(
 
                     n_orig = len(raw_poly)
                     analitica = gvar.get("analitica_segmentos") or []
-                    segmentos = [
-                        (f"{s['origen']}_{s['destino']}", max(0, min(int(s["origen"]), n_orig - 1)))
-                        for s in analitica
-                        if s.get("origen") is not None and s.get("destino") is not None
-                    ] or [(f"{i}_{i + 1}", i) for i in range(max(n_orig - 1, 1))]
+                    if nivel == "segmento":
+                        if n_orig != len(gvar.get("puntos") or []):
+                            raise ValueError(
+                                f"Hoja {id_hdr}, {var}: se descartaron vértices inválidos; "
+                                "no se pueden mantener las posiciones de los segmentos."
+                            )
+                        segmentos = segmentos_por_orden(analitica, n_orig, id_hdr, var)
+                    else:
+                        # En modo viaje solo se necesita el conteo, no ubicar nodos.
+                        segmentos = [(None, i) for i in range(len(analitica) or n_orig - 1)]
 
                     vehiculos.add(veh_id)
                     recorridos_por_bucket[b_id].append(
@@ -1675,15 +1722,18 @@ def _(
                     total_segs = len(rec["segmentos"])
                     osrm_min = round(rec["duracion_s"] / 60.0, 2)
                     real_min = round(dur_real_s / 60.0, 2)
+                    dt_sal = datetime.fromtimestamp(ts_sal, tz=UTC)
+                    dt_lleg = datetime.fromtimestamp(ts_lleg, tz=UTC)
 
                     if nivel == "viaje":
-                        dt_sal = datetime.fromtimestamp(ts_sal, tz=UTC)
                         filas_buffer.append(
                             {
                                 "idrecorrido": idrecorrido,
                                 "idhojaruta": rec["idhojaruta"],
                                 "idvehiculo": rec["idvehiculo"],
                                 "total_segmentos": total_segs,
+                                "salida_recorrido_utc": dt_sal,
+                                "llegada_recorrido_utc": dt_lleg,
                                 "instant_t_fechahora": dt_sal,
                                 "t_franjahoraria": franja_horaria(dt_sal.hour),
                                 "t_dia_semana": (dt_sal.weekday() + 1) % 7,
@@ -1730,6 +1780,8 @@ def _(
                                     "idhojaruta": rec["idhojaruta"],
                                     "idvehiculo": rec["idvehiculo"],
                                     "total_segmentos": total_segs,
+                                    "salida_recorrido_utc": dt_sal,
+                                    "llegada_recorrido_utc": dt_lleg,
                                     "instant_t_fechahora": dt_act,
                                     "t_franjahoraria": franja_horaria(dt_act.hour),
                                     "t_dia_semana": (dt_act.weekday() + 1) % 7,
@@ -1760,23 +1812,34 @@ def _(
         if total_filas_guardadas == 0:
             raise RuntimeError("No se encontraron pasadas válidas con los parámetros indicados.")
 
-        # --- 4. Split temporal 80/20 y estadísticas del preprocesador en modo LAZY ---
+        # --- 4. Split por días de salida de viajes, nunca por fechas de segmentos ---
         lf = pl.scan_parquet(str(partes_dir / "part_*.parquet"))
         dias_unicos = (
-            lf.select(pl.col("instant_t_fechahora").dt.date().alias("dia"))
+            lf.select(pl.col("salida_recorrido_utc").dt.date().alias("dia"))
             .unique()
             .sort("dia")
             .collect()["dia"]
             .to_list()
         )
         if len(dias_unicos) < 2:
-            raise RuntimeError("Se necesitan al menos 2 días distintos para el split temporal 80/20.")
+            raise RuntimeError("Se necesitan al menos 2 días de salida distintos para el split temporal 80/20.")
 
         corte = max(1, min(len(dias_unicos) - 1, int(len(dias_unicos) * proporcion_train)))
         primer_dia_test = dias_unicos[corte]
 
-        lf_train = lf.filter(pl.col("instant_t_fechahora").dt.date() < primer_dia_test)
-        lf_test = lf.filter(pl.col("instant_t_fechahora").dt.date() >= primer_dia_test)
+        lf_train = filtrar_particion_p3(lf, primer_dia_test, "train")
+        lf_test = filtrar_particion_p3(lf, primer_dia_test, "test")
+        lf_excluidos = lf.filter(
+            (pl.col("salida_recorrido_utc").dt.date() < primer_dia_test)
+            & (pl.col("llegada_recorrido_utc").dt.date() >= primer_dia_test)
+        )
+        n_train = lf_train.select(pl.len()).collect().item()
+        n_test = lf_test.select(pl.len()).collect().item()
+        if not n_train or not n_test:
+            raise RuntimeError(
+                "No quedan viajes en ambos conjuntos tras excluir los que cruzan "
+                "el corte temporal. Ajustar el período o proporcion_train."
+            )
 
         cols_num = [
             "total_segmentos",
@@ -1828,13 +1891,17 @@ def _(
             )
             cat_vocab[c] = vals
 
-        n_train = lf_train.select(pl.len()).collect().item()
-        n_test = lf_test.select(pl.len()).collect().item()
         n_features = len(cols_num) + sum(len(v) for v in cat_vocab.values())
 
         meta = {
+            "version_dataset": 2,
             "partes_dir": str(partes_dir),
             "primer_dia_test": primer_dia_test.isoformat(),
+            "politica_particion": "salida_del_viaje_con_purga_de_cruces",
+            "n_viajes_train": lf_train.select(pl.col("idrecorrido").n_unique()).collect().item(),
+            "n_viajes_test": lf_test.select(pl.col("idrecorrido").n_unique()).collect().item(),
+            "n_viajes_excluidos_corte": lf_excluidos.select(pl.col("idrecorrido").n_unique()).collect().item(),
+            "n_filas_excluidas_corte": lf_excluidos.select(pl.len()).collect().item(),
             "objetivo": objetivo,
             "cols_num": cols_num,
             "cols_cat": cols_cat,
@@ -1855,6 +1922,10 @@ def _(
         Crea un tf.data.Dataset que lee y transforma lotes desde Parquet en disco
         con consumo mínimo de RAM.
         """
+        if meta.get("version_dataset") != 2:
+            raise ValueError("Reconstruí el dataset P3: la caché anterior no garantiza partición por viaje.")
+        if split not in ("train", "test"):
+            raise ValueError("split debe ser 'train' o 'test'")
         import tensorflow as tf
 
         partes = sorted(Path(meta["partes_dir"]).glob("part_*.parquet"))
@@ -1897,10 +1968,7 @@ def _(
 
             for ruta in archivos:
                 lf = pl.scan_parquet(ruta)
-                if es_train:
-                    lf = lf.filter(pl.col("instant_t_fechahora").dt.date() < corte_dt)
-                else:
-                    lf = lf.filter(pl.col("instant_t_fechahora").dt.date() >= corte_dt)
+                lf = filtrar_particion_p3(lf, corte_dt, split)
 
                 df_chunk = lf.collect()
                 if df_chunk.is_empty():
@@ -1959,7 +2027,9 @@ def _(GPS, HDR, Path, armar_dataset_p3_streaming, boton_armar_ds, mo, pl):
     mo.vstack([
         mo.md(
             f"Dataset listo en disco: **{meta_ds_p3['n_train']:,}** filas train / "
-            f"**{meta_ds_p3['n_test']:,}** filas test · **{meta_ds_p3['n_features']}** features."
+            f"**{meta_ds_p3['n_test']:,}** filas test · **{meta_ds_p3['n_features']}** features. "
+            f"Viajes train/test: **{meta_ds_p3['n_viajes_train']:,} / {meta_ds_p3['n_viajes_test']:,}**. "
+            f"Viajes excluidos por cruzar el corte: **{meta_ds_p3['n_viajes_excluidos_corte']:,}**."
         ),
         mo.ui.table(muestra.to_dicts(), selection=None),
     ])

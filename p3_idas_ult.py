@@ -9,6 +9,7 @@ def _():
     import json
     import math
     import sys
+    import time
     from bisect import bisect_left, bisect_right
     from collections import defaultdict
     from datetime import UTC, datetime, timedelta
@@ -21,35 +22,23 @@ def _():
 
     import ijson
     import marimo as mo
-    import pandas as pd
     import polars as pl
     import tensorflow as tf
-
-    from bson import a_dt, a_float, a_id
 
     # Marimo vuelve local cualquier nombre con _, por eso se comparten sin _.
     _directorio = str(Path(__file__).resolve().parent)
     if _directorio not in sys.path:
         sys.path.insert(0, _directorio)
 
-    from bisect import bisect_left, bisect_right
-    from collections import defaultdict
-    from datetime import UTC, datetime, timedelta
-    import json
-    import math
-    from pathlib import Path
-
-    import ijson
-    import numpy as np
-    import pandas as pd
-    import polars as pl
-    from sklearn.compose import ColumnTransformer
-    from sklearn.impute import SimpleImputer
-    from sklearn.pipeline import Pipeline
-    from sklearn.preprocessing import OneHotEncoder, StandardScaler
+    from bson import a_dt, a_float, a_id
+    from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
+    from sklearn.model_selection import ParameterGrid
 
     return (
+        HistGradientBoostingRegressor,
+        ParameterGrid,
         Path,
+        RandomForestRegressor,
         UTC,
         a_dt,
         a_float,
@@ -68,6 +57,7 @@ def _():
         shutil,
         sys,
         tf,
+        time,
         timedelta,
         zlib,
     )
@@ -79,8 +69,10 @@ def _(mo):
     # P3 — el reloj de una ida
 
     Mide cuánto tardó una ida con el reloj del GPS, no con OSRM ni con las observaciones.
-    Los insumos ya están recortados: `entregables/p3/hojaDeRuta.json` y `entregables/p3/rastreoSatelital.json`.
-    No es el dump de origen. Nada corre al abrir. Primero se mira una hoja. Después se cuentan todas.
+    Los insumos ya están recortados: `data-v2/hojaDeRuta.json` y `data-v2/rastreoSatelital.json`.
+    No es el dump de origen. El procesamiento pesado se inicia con los botones.
+    Primero se puede mirar una hoja y contar todas; después se construye el dataset,
+    se entrenan los modelos y se comparan sus ETA con OSRM.
     """)
     return
 
@@ -220,7 +212,7 @@ def _(mo):
 
     Esta celda no mide el reloj. Junta la hoja de ruta y el rastreo ya recortados, y le pasa los pings a la regla de arriba. El ejemplo y el conteo llaman a la misma función, `resumenes_de`.
 
-    Los dos archivos los escribió `uv run python -m src p3`. La hoja sale de `opsapp2.hojaderutas.json`. El rastreo sale de `opsapp2.rastreosatelital_listas.json`. Acá no se vuelve a cortar el dump, y no se lee `observacionesSegmentosViales.json`.
+    Se usan los dos JSON recortados de la entrega, ubicados en `data-v2/`. La hoja proviene de `opsapp2.hojaderutas.json` y el rastreo de `opsapp2.rastreosatelital_listas.json`. Acá no se vuelve a cortar el dump, y no se lee `observacionesSegmentosViales.json`.
 
     - La hoja. De cada documento se queda la ida: `geometriaOSRM.ida.puntos`, en `[lat, lon]`. La vuelta y la alternativa no se leen.
         - `analitica_segmentos` se vacía al leer: pesa, y esta medición no lo usa.
@@ -265,13 +257,13 @@ def _(
 
     # Sin _: la hoja y el conteo llaman a esto desde otra celda.
     # Marimo vuelve local cualquier nombre con _.
-    _RAIZ = Path(__file__).resolve().parents[2]
+    _RAIZ = Path(__file__).resolve().parent
     if str(_RAIZ) not in sys.path:
         sys.path.insert(0, str(_RAIZ))
 
 
-    HDR = _RAIZ / "entregables" / "p3" / "hojaDeRuta.json"
-    GPS = _RAIZ / "entregables" / "p3" / "rastreoSatelital.json"
+    HDR = _RAIZ / "data-v2" / "hojaDeRuta.json"
+    GPS = _RAIZ / "data-v2" / "rastreoSatelital.json"
     CACHE = _RAIZ / "parquet" / "p3_cuentas"
 
     print(HDR)
@@ -2011,7 +2003,7 @@ def _(GPS, HDR, Path, armar_dataset_p3_streaming, boton_armar_ds, mo, pl):
         mo.md("Presioná el botón para construir los fragmentos Parquet en disco."),
     )
 
-    dir_ds_p3 = Path(__file__).resolve().parents[2] / "parquet" / "dataset_p3_idas"
+    dir_ds_p3 = Path(__file__).resolve().parent / "parquet" / "dataset_p3_idas"
     meta_ds_p3 = armar_dataset_p3_streaming(
         hdr_path=HDR,
         gps_path=GPS,
@@ -2060,6 +2052,779 @@ def _(crear_tf_dataset, meta_ds_p3, tf):
         train_ds,
         validation_data=val_ds,
         epochs=50,
+    )
+    return historial_p3, modelo_p3
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Evaluación: ETA del modelo contra OSRM
+
+    Desde acá se usa el modelo ya entrenado sobre el conjunto de test (días posteriores al corte).
+    Se calculan los minutos predichos, las dos ETA (al salir y en ruta), el error contra OSRM
+    y la regla de aviso.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **Predicciones sobre test.** Lee los fragmentos Parquet, se queda con las filas de test,
+    aplica la misma transformación del entrenamiento y agrega la columna `pred_modelo_min`
+    (minutos que faltan según el modelo). Las filas con `segmento_orden_actual == 1` son el instante de salida ($t=0$).
+    """)
+    return
+
+
+@app.cell
+def _(Path, datetime, meta_ds_p3, modelo_p3, np, pl):
+    _COLS = [
+        "idrecorrido",
+        "salida_recorrido_utc",
+        "llegada_recorrido_utc",
+        "instant_t_fechahora",
+        "segmento_orden_actual",
+        "pct_progreso_recorrido",
+        "minutos_ya_transcurridos",
+        "osrm_total_est_min",
+        "osrm_restante_est_min",
+        "y_al_salir_minutos",
+        "y_en_viaje_minutos",
+    ]
+
+    def _transformar_X(df, meta):
+        # Igual que crear_tf_dataset: mediana para nulos, z-score, one-hot con vocabulario de train.
+        bloques = []
+        for c in meta["cols_num"]:
+            st = meta["num_stats"][c]
+            arr = df[c].fill_null(st["median"]).to_numpy().astype(np.float32)
+            bloques.append(((arr - st["mean"]) / st["std"])[:, None])
+        for c in meta["cols_cat"]:
+            serie = df[c].fill_null("desconocido")
+            for val in meta["cat_vocab"][c]:
+                bloques.append((serie == val).to_numpy().astype(np.float32)[:, None])
+        return np.hstack(bloques).astype(np.float32)
+
+    _corte = datetime.fromisoformat(meta_ds_p3["primer_dia_test"]).date()
+    _partes = sorted(Path(meta_ds_p3["partes_dir"]).glob("part_*.parquet"))
+    _trozos = []
+    for _ruta in _partes:
+        _df = (
+            pl.scan_parquet(_ruta)
+            .filter(pl.col("salida_recorrido_utc").dt.date() >= _corte)
+            .collect()
+        )
+        if _df.is_empty():
+            continue
+        _pred = modelo_p3.predict(
+            _transformar_X(_df, meta_ds_p3), batch_size=4096, verbose=0
+        ).ravel()
+        _trozos.append(
+            _df.select(_COLS).with_columns(pl.Series("pred_modelo_min", _pred))
+        )
+
+    df_test = pl.concat(_trozos)
+    df_test.head(5)
+    return (df_test,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **OSRM calibrado.** Además de OSRM tal cual, se arma un baseline más justo: OSRM multiplicado por
+    un factor $k$ (mediana de `real / OSRM` en los viajes de **train**). Sirve para ver si el modelo
+    mejora algo más que una simple corrección de escala. También recuerda que la etiqueta termina
+    en la zona de llegada (85 % de la lista), no en el último punto.
+    """)
+    return
+
+
+@app.cell
+def _(Path, datetime, df_test, meta_ds_p3, mo, pl):
+    _corte = datetime.fromisoformat(meta_ds_p3["primer_dia_test"]).date()
+    _sal = pl.col("salida_recorrido_utc").dt.date()
+    _lle = pl.col("llegada_recorrido_utc").dt.date()
+    _k = (
+        pl.scan_parquet(str(Path(meta_ds_p3["partes_dir"]) / "part_*.parquet"))
+        .filter((_sal < _corte) & (_lle < _corte))
+        .filter(pl.col("segmento_orden_actual") == 1)
+        .filter(pl.col("osrm_total_est_min") > 0)
+        .select(
+            (pl.col("y_al_salir_minutos") / pl.col("osrm_total_est_min"))
+            .median()
+            .alias("k")
+        )
+        .collect()
+    )
+    K_OSRM = float(_k["k"][0])
+
+    df_ev = df_test.with_columns(
+        (pl.col("osrm_total_est_min") * K_OSRM).alias("osrm_cal_total"),
+        (pl.col("osrm_restante_est_min") * K_OSRM).alias("osrm_cal_rest"),
+    )
+    mo.md(f"Factor de calibración **k = {K_OSRM:.3f}** (real / OSRM, mediana en train).")
+    return K_OSRM, df_ev
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **Error en minutos, al salir y en ruta.** Compara OSRM, OSRM calibrado y el modelo.
+    MAE es el error absoluto medio, RMSE penaliza más los errores grandes y el sesgo indica si
+    sobreestima (+) o subestima (−). La última columna es la mejora del MAE respecto de OSRM.
+    """)
+    return
+
+
+@app.cell
+def _(df_ev, mo, pl):
+    def _fila(df, momento, metodo, pred, real):
+        e = pl.col(pred) - pl.col(real)
+        r = df.select(
+            e.abs().mean().alias("mae"),
+            e.pow(2).mean().sqrt().alias("rmse"),
+            e.mean().alias("sesgo"),
+            pl.len().alias("n"),
+        ).row(0, named=True)
+        return {
+            "momento": momento,
+            "método": metodo,
+            "MAE (min)": round(r["mae"], 2),
+            "RMSE (min)": round(r["rmse"], 2),
+            "sesgo (min)": round(r["sesgo"], 2),
+            "n filas": r["n"],
+        }
+
+    _t0 = df_ev.filter(pl.col("segmento_orden_actual") == 1)
+    _en = df_ev.filter(pl.col("segmento_orden_actual") > 1)
+    _filas = [
+        _fila(_t0, "Al salir (t=0)", "OSRM", "osrm_total_est_min", "y_en_viaje_minutos"),
+        _fila(_t0, "Al salir (t=0)", "OSRM calibrado", "osrm_cal_total", "y_en_viaje_minutos"),
+        _fila(_t0, "Al salir (t=0)", "Modelo", "pred_modelo_min", "y_en_viaje_minutos"),
+        _fila(_en, "En ruta (t>0)", "OSRM", "osrm_restante_est_min", "y_en_viaje_minutos"),
+        _fila(_en, "En ruta (t>0)", "OSRM calibrado", "osrm_cal_rest", "y_en_viaje_minutos"),
+        _fila(_en, "En ruta (t>0)", "Modelo", "pred_modelo_min", "y_en_viaje_minutos"),
+    ]
+    for _i in (0, 3):
+        _base = _filas[_i]["MAE (min)"]
+        for _j in range(_i, _i + 3):
+            _filas[_j]["mejora MAE vs OSRM (%)"] = round(
+                100 * (_base - _filas[_j]["MAE (min)"]) / _base, 1
+            )
+    mo.ui.table(_filas, selection=None)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **Error según el avance del viaje.** Separa las filas en cuatro bloques por porcentaje de progreso
+    (por posición en la lista de segmentos). Muestra si el modelo mejora sobre todo al principio,
+    en el medio o cerca del final.
+    """)
+    return
+
+
+@app.cell
+def _(df_ev, mo, pl):
+    _bloque = (pl.col("pct_progreso_recorrido") // 25).clip(0, 3).cast(pl.Int32)
+    _etiqueta = (
+        pl.when(pl.col("bloque") == 0).then(pl.lit("0–25 %"))
+        .when(pl.col("bloque") == 1).then(pl.lit("25–50 %"))
+        .when(pl.col("bloque") == 2).then(pl.lit("50–75 %"))
+        .otherwise(pl.lit("75–100 %"))
+        .alias("avance del viaje")
+    )
+
+    def _mae(pred):
+        return (pl.col(pred) - pl.col("y_en_viaje_minutos")).abs().mean().round(2)
+
+    _por_avance = (
+        df_ev.with_columns(_bloque.alias("bloque"))
+        .group_by("bloque")
+        .agg(
+            _mae("osrm_restante_est_min").alias("MAE OSRM (min)"),
+            _mae("osrm_cal_rest").alias("MAE OSRM calibrado (min)"),
+            _mae("pred_modelo_min").alias("MAE modelo (min)"),
+            pl.len().alias("n filas"),
+        )
+        .sort("bloque")
+        .with_columns(_etiqueta)
+        .drop("bloque")
+    )
+    mo.ui.table(_por_avance.to_dicts(), selection=None)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **Tolerancia del aviso.** Margen en minutos que se permite antes de avisar. Sin tolerancia,
+    cualquier ruido de la predicción dispara un aviso. Al moverlo se recalculan las celdas siguientes.
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    tol_min = mo.ui.slider(0, 30, value=5, step=1, label="Tolerancia del aviso (min)", show_value=True)
+    tol_min
+    return (tol_min,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **Las dos ETA.** Para cada instante $t$ se calcula la hora estimada de llegada con cada fuente:
+
+    - ETA al salir = hora de salida + duración estimada al salir.
+    - ETA en ruta = hora del instante $t$ + minutos que faltan estimados.
+
+    Hay un aviso cuando la ETA en ruta supera a la ETA al salir más la tolerancia.
+    Se calcula igual para OSRM y para el modelo.
+    """)
+    return
+
+
+@app.cell
+def _(df_ev, pl, tol_min):
+    def _mas_min(col_dt, col_min):
+        return pl.col(col_dt) + pl.duration(microseconds=(pl.col(col_min) * 60e6).cast(pl.Int64))
+
+    _pred_t0 = df_ev.filter(pl.col("segmento_orden_actual") == 1).select(
+        "idrecorrido", pl.col("pred_modelo_min").alias("pred_t0")
+    )
+    _tol = pl.duration(minutes=int(tol_min.value))
+
+    df_eta = (
+        df_ev.join(_pred_t0, on="idrecorrido", how="left")
+        .with_columns(
+            _mas_min("salida_recorrido_utc", "osrm_total_est_min").alias("eta_salida_osrm"),
+            _mas_min("salida_recorrido_utc", "pred_t0").alias("eta_salida_modelo"),
+            _mas_min("instant_t_fechahora", "osrm_restante_est_min").alias("eta_t_osrm"),
+            _mas_min("instant_t_fechahora", "pred_modelo_min").alias("eta_t_modelo"),
+        )
+        .with_columns(
+            (pl.col("eta_t_osrm") > pl.col("eta_salida_osrm") + _tol).alias("aviso_osrm"),
+            (pl.col("eta_t_modelo") > pl.col("eta_salida_modelo") + _tol).alias("aviso_modelo"),
+        )
+    )
+    df_eta.height
+    return (df_eta,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **Ejemplo de un viaje.** Muestra cómo evolucionan las ETA y cuándo se activa el aviso en un
+    mismo recorrido (se toman unas 15 filas repartidas a lo largo del viaje).
+    """)
+    return
+
+
+@app.cell
+def _(df_eta, mo, pl):
+    _id = df_eta["idrecorrido"][0]
+    _uno = df_eta.filter(pl.col("idrecorrido") == _id)
+    _ej = _uno.gather_every(max(1, _uno.height // 15)).select(
+        "segmento_orden_actual",
+        "instant_t_fechahora",
+        "eta_salida_osrm",
+        "eta_t_osrm",
+        "aviso_osrm",
+        "eta_salida_modelo",
+        "eta_t_modelo",
+        "aviso_modelo",
+        "llegada_recorrido_utc",
+    )
+    mo.vstack([mo.md(f"Recorrido `{_id}`"), mo.ui.table(_ej.to_dicts(), selection=None)])
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **Calidad del aviso por viaje.** Un viaje cuenta como *avisado* si el aviso se activó en algún
+    instante. Cuenta como *demorado* si llegó después de su ETA al salir más la tolerancia
+    (cada fuente se mide contra su propia promesa).
+
+    - Precisión: de los avisos, cuántos eran demoras reales.
+    - Recall: de las demoras reales, cuántas se avisaron.
+    - Anticipación: minutos entre el primer aviso y la llegada real (mediana).
+    """)
+    return
+
+
+@app.cell
+def _(df_eta, mo, pl, tol_min):
+    _tol = pl.duration(minutes=int(tol_min.value))
+    _viajes = df_eta.group_by("idrecorrido").agg(
+        pl.col("llegada_recorrido_utc").first().alias("llegada"),
+        pl.col("eta_salida_osrm").first().alias("eta0_osrm"),
+        pl.col("eta_salida_modelo").first().alias("eta0_modelo"),
+        pl.col("aviso_osrm").any().alias("av_osrm"),
+        pl.col("aviso_modelo").any().alias("av_modelo"),
+        pl.col("instant_t_fechahora").filter(pl.col("aviso_osrm")).min().alias("t_av_osrm"),
+        pl.col("instant_t_fechahora").filter(pl.col("aviso_modelo")).min().alias("t_av_modelo"),
+    ).with_columns(
+        (pl.col("llegada") > pl.col("eta0_osrm") + _tol).alias("demora_osrm"),
+        (pl.col("llegada") > pl.col("eta0_modelo") + _tol).alias("demora_modelo"),
+    )
+
+    def _resumen(nombre, av, dem, t_av):
+        d = _viajes.select(
+            (pl.col(av) & pl.col(dem)).sum().alias("tp"),
+            (pl.col(av) & ~pl.col(dem)).sum().alias("fp"),
+            (~pl.col(av) & pl.col(dem)).sum().alias("fn"),
+            (~pl.col(av) & ~pl.col(dem)).sum().alias("tn"),
+            pl.col(dem).sum().alias("n_demoras"),
+        ).row(0, named=True)
+        ant = (
+            _viajes.filter(pl.col(av) & pl.col(dem))
+            .select(((pl.col("llegada") - pl.col(t_av)).dt.total_seconds() / 60).median())
+            .item()
+        )
+        prec = d["tp"] / (d["tp"] + d["fp"]) if (d["tp"] + d["fp"]) else None
+        rec = d["tp"] / (d["tp"] + d["fn"]) if (d["tp"] + d["fn"]) else None
+        return {
+            "fuente": nombre,
+            "viajes": _viajes.height,
+            "demoras reales": d["n_demoras"],
+            "avisos correctos": d["tp"],
+            "falsas alarmas": d["fp"],
+            "demoras sin aviso": d["fn"],
+            "precisión": None if prec is None else round(prec, 3),
+            "recall": None if rec is None else round(rec, 3),
+            "anticipación mediana (min)": None if ant is None else round(ant, 1),
+        }
+
+    resumen_aviso = [
+        _resumen("OSRM", "av_osrm", "demora_osrm", "t_av_osrm"),
+        _resumen("Modelo", "av_modelo", "demora_modelo", "t_av_modelo"),
+    ]
+    mo.ui.table(resumen_aviso, selection=None)
+    return (resumen_aviso,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **¿Existe la hora programada de las paradas?** La regla contra el plan solo se puede aplicar
+    cuando `paradas[].hora` existe. Esta celda lee unas pocas hojas y muestra qué campos de paradas
+    hay y con qué formato, para decidir cómo incorporarlos.
+    """)
+    return
+
+
+@app.cell
+def _(HDR, json, mo):
+    mo.stop(not HDR.exists(), mo.md("Ubicá `hojaDeRuta.json` en `data-v2/` para inspeccionar las paradas."))
+    _claves = {}
+    _n = 0
+    with open(HDR, encoding="utf-8") as _f:
+        for _linea in _f:
+            _linea = _linea.strip().rstrip(",")
+            if _linea in ("", "[", "]"):
+                continue
+            try:
+                _doc = json.loads(_linea)
+            except Exception:
+                continue
+            _n += 1
+            for _k, _v in _doc.items():
+                if "parad" in _k.lower() and _k not in _claves:
+                    _claves[_k] = repr(_v)[:400]
+            if _n >= 300:
+                break
+    mo.md(
+        f"Hojas leídas: **{_n}**. Campos con 'parad' en el nombre:\n\n"
+        + ("\n".join(f"- `{k}`: `{v}`" for k, v in _claves.items()) or "_ninguno_")
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Modelos de árboles: HistGradientBoosting y Random Forest
+
+    Mismo problema que la red neuronal (predecir los minutos que faltan, `y_en_viaje_minutos`) y mismas
+    variables de entrada. Cambia solo el algoritmo. Para elegir la mejor configuración se prueban
+    muchas combinaciones de hiperparámetros y se compara el error en un tramo de validación
+    (los días más recientes del entrenamiento). El conjunto de test se usa una sola vez, al final.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **Configuración.** Acá se define cuántas filas se usan y qué combinaciones se prueban.
+
+    - `PASO_ARB`: se toma un instante cada N segmentos de cada pasada (siempre incluye la salida).
+      Con un número más grande hay menos filas y todo corre más rápido.
+    - `GRID_HGB` y `GRID_RF`: valores a probar para cada hiperparámetro. Se prueban todas las combinaciones.
+      Si tarda demasiado, sacá valores de las listas.
+    """)
+    return
+
+
+@app.cell
+def _():
+    PASO_ARB = 30
+    SEMILLA_ARB = 42
+
+    # HistGradientBoosting: 2 x 2 x 3 x 3 x 2 = 72 combinaciones
+    GRID_HGB = {
+        "loss": ["squared_error", "absolute_error"],
+        "learning_rate": [0.05, 0.1],
+        "max_leaf_nodes": [15, 31, 63],
+        "min_samples_leaf": [20, 100, 400],
+        "max_iter": [150, 300],
+    }
+
+    # Random Forest: 2 x 2 x 3 x 2 = 24 combinaciones
+    GRID_RF = {
+        "n_estimators": [100, 200],
+        "max_depth": [10, None],
+        "min_samples_leaf": [10, 50, 150],
+        "max_features": [0.5, 1.0],
+    }
+    return GRID_HGB, GRID_RF, PASO_ARB, SEMILLA_ARB
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **Datos de entrenamiento y validación.** Lee los Parquet, toma una muestra de instantes de cada pasada
+    de train y la divide por fecha: el 80 % de los días más antiguos para ajustar y el 20 % más reciente
+    para validar. Las pasadas que cruzan la fecha de corte quedan afuera de ambos. Los árboles no necesitan
+    normalizar, así que solo se completan los nulos con la mediana de train y se codifican las categorías
+    (one-hot), igual que en la red.
+    """)
+    return
+
+
+@app.cell
+def _(Path, PASO_ARB, datetime, meta_ds_p3, mo, np, pl):
+    def arb_matriz(df, meta):
+        bloques = []
+        for c in meta["cols_num"]:
+            med = meta["num_stats"][c]["median"]
+            bloques.append(df[c].fill_null(med).to_numpy().astype(np.float32)[:, None])
+        for c in meta["cols_cat"]:
+            serie = df[c].fill_null("desconocido")
+            for val in meta["cat_vocab"][c]:
+                bloques.append((serie == val).to_numpy().astype(np.float32)[:, None])
+        return np.hstack(bloques).astype(np.float32)
+
+    arb_nombres = list(meta_ds_p3["cols_num"]) + [
+        f"{c}={v}" for c in meta_ds_p3["cols_cat"] for v in meta_ds_p3["cat_vocab"][c]
+    ]
+
+    _corte = datetime.fromisoformat(meta_ds_p3["primer_dia_test"]).date()
+    _cols = (
+        list(meta_ds_p3["cols_num"])
+        + list(meta_ds_p3["cols_cat"])
+        + ["y_en_viaje_minutos", "salida_recorrido_utc", "llegada_recorrido_utc"]
+    )
+    _trozos = []
+    for _ruta in sorted(Path(meta_ds_p3["partes_dir"]).glob("part_*.parquet")):
+        _df = (
+            pl.scan_parquet(_ruta)
+            .filter((pl.col("segmento_orden_actual") - 1) % PASO_ARB == 0)
+            .filter(
+                (pl.col("salida_recorrido_utc").dt.date() < _corte)
+                & (pl.col("llegada_recorrido_utc").dt.date() < _corte)
+            )
+            .select(_cols)
+            .collect()
+        )
+        if not _df.is_empty():
+            _trozos.append(_df)
+    _train = pl.concat(_trozos)
+
+    _dias = _train.select(pl.col("salida_recorrido_utc").dt.date().unique().sort()).to_series()
+    _corte_val = _dias[int(len(_dias) * 0.8)]
+    _fit = _train.filter(pl.col("llegada_recorrido_utc").dt.date() < _corte_val)
+    _val = _train.filter(pl.col("salida_recorrido_utc").dt.date() >= _corte_val)
+
+    X_fit = arb_matriz(_fit, meta_ds_p3)
+    y_fit = _fit["y_en_viaje_minutos"].to_numpy()
+    X_val = arb_matriz(_val, meta_ds_p3)
+    y_val = _val["y_en_viaje_minutos"].to_numpy()
+    X_trn = arb_matriz(_train, meta_ds_p3)
+    y_trn = _train["y_en_viaje_minutos"].to_numpy()
+
+    mo.md(
+        f"Filas para ajustar: **{len(y_fit):,}** · para validar: **{len(y_val):,}** · "
+        f"train completo (para el ajuste final): **{len(y_trn):,}** · "
+        f"variables de entrada: **{X_fit.shape[1]}** · validación desde **{_corte_val}**."
+    )
+    return X_fit, X_trn, X_val, arb_matriz, arb_nombres, y_fit, y_trn, y_val
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **Botones de búsqueda.** Probar todas las combinaciones tarda varios minutos, por eso no corre solo:
+    hay que apretar el botón de cada modelo.
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    boton_hgb = mo.ui.run_button(label="Buscar configuración: HistGradientBoosting")
+    boton_rf = mo.ui.run_button(label="Buscar configuración: Random Forest")
+    mo.hstack([boton_hgb, boton_rf], justify="start")
+    return boton_hgb, boton_rf
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **Búsqueda con HistGradientBoosting.** Entrena un modelo por cada combinación de `GRID_HGB` con los datos de
+    ajuste y mide el error en validación. La tabla muestra las 10 mejores, ordenadas por MAE (minutos).
+    La mejor combinación queda guardada en `mejor_hgb`.
+    """)
+    return
+
+
+@app.cell
+def _(GRID_HGB, HistGradientBoostingRegressor, ParameterGrid, SEMILLA_ARB, X_fit, X_val, boton_hgb, mo, np, pl, time, y_fit, y_val):
+
+    mo.stop(not boton_hgb.value, mo.md("Apretá el botón para correr la búsqueda."))
+
+    _filas = []
+    for _p in mo.status.progress_bar(list(ParameterGrid(GRID_HGB)), title="HistGradientBoosting"):
+        _t = time.time()
+        _m = HistGradientBoostingRegressor(random_state=SEMILLA_ARB, **_p).fit(X_fit, y_fit)
+        _e = _m.predict(X_val) - y_val
+        _filas.append(
+            {
+                **_p,
+                "MAE val": float(np.mean(np.abs(_e))),
+                "RMSE val": float(np.sqrt(np.mean(_e**2))),
+                "sesgo val": float(np.mean(_e)),
+                "seg": round(time.time() - _t, 1),
+            }
+        )
+
+    _orden = sorted(_filas, key=lambda r: r["MAE val"])
+    mejor_hgb = {k: _orden[0][k] for k in GRID_HGB}
+    res_hgb = pl.DataFrame(_orden).with_columns(pl.col("MAE val", "RMSE val", "sesgo val").round(2))
+    mo.vstack(
+        [
+            mo.md(f"Combinaciones probadas: **{len(_orden)}**. Mejor: `{mejor_hgb}`"),
+            mo.ui.table(res_hgb.head(10).to_dicts(), selection=None),
+        ]
+    )
+    return mejor_hgb, res_hgb
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **Búsqueda con Random Forest.** Igual que la anterior, con las combinaciones de `GRID_RF`.
+    Es más lenta, sobre todo con árboles sin límite de profundidad. La mejor combinación queda en `mejor_rf`.
+    """)
+    return
+
+
+@app.cell
+def _(GRID_RF, ParameterGrid, RandomForestRegressor, SEMILLA_ARB, X_fit, X_val, boton_rf, mo, np, pl, time, y_fit, y_val):
+
+    mo.stop(not boton_rf.value, mo.md("Apretá el botón para correr la búsqueda."))
+
+    _filas = []
+    for _p in mo.status.progress_bar(list(ParameterGrid(GRID_RF)), title="Random Forest"):
+        _t = time.time()
+        _m = RandomForestRegressor(random_state=SEMILLA_ARB, n_jobs=-1, **_p).fit(X_fit, y_fit)
+        _e = _m.predict(X_val) - y_val
+        _filas.append(
+            {
+                **_p,
+                "MAE val": float(np.mean(np.abs(_e))),
+                "RMSE val": float(np.sqrt(np.mean(_e**2))),
+                "sesgo val": float(np.mean(_e)),
+                "seg": round(time.time() - _t, 1),
+            }
+        )
+
+    _orden = sorted(_filas, key=lambda r: r["MAE val"])
+    mejor_rf = {k: _orden[0][k] for k in GRID_RF}
+    res_rf = pl.DataFrame(_orden).with_columns(pl.col("MAE val", "RMSE val", "sesgo val").round(2))
+    mo.vstack(
+        [
+            mo.md(f"Combinaciones probadas: **{len(_orden)}**. Mejor: `{mejor_rf}`"),
+            mo.ui.table(res_rf.head(10).to_dicts(), selection=None),
+        ]
+    )
+    return mejor_rf, res_rf
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **Ajuste final y predicción sobre test.** Entrena cada modelo con su mejor configuración usando todo
+    el train (muestra) y predice todas las filas de test, en el mismo orden que `df_ev`. Agrega las columnas
+    `pred_hgb` y `pred_rf` (minutos que faltan).
+    """)
+    return
+
+
+@app.cell
+def _(
+    HistGradientBoostingRegressor,
+    Path,
+    RandomForestRegressor,
+    SEMILLA_ARB,
+    X_trn,
+    arb_matriz,
+    datetime,
+    df_ev,
+    mejor_hgb,
+    mejor_rf,
+    meta_ds_p3,
+    mo,
+    np,
+    pl,
+    y_trn,
+):
+    hgb_final = HistGradientBoostingRegressor(random_state=SEMILLA_ARB, **mejor_hgb).fit(X_trn, y_trn)
+    rf_final = RandomForestRegressor(random_state=SEMILLA_ARB, n_jobs=-1, **mejor_rf).fit(X_trn, y_trn)
+
+    _corte = datetime.fromisoformat(meta_ds_p3["primer_dia_test"]).date()
+    _ph, _pr = [], []
+    for _ruta in sorted(Path(meta_ds_p3["partes_dir"]).glob("part_*.parquet")):
+        _df = (
+            pl.scan_parquet(_ruta)
+            .filter(pl.col("salida_recorrido_utc").dt.date() >= _corte)
+            .collect()
+        )
+        if _df.is_empty():
+            continue
+        _X = arb_matriz(_df, meta_ds_p3)
+        _ph.append(hgb_final.predict(_X))
+        _pr.append(rf_final.predict(_X))
+
+    _ph = np.concatenate(_ph)
+    _pr = np.concatenate(_pr)
+    assert len(_ph) == df_ev.height, "El orden o la cantidad de filas de test no coincide con df_ev"
+    df_cmp = df_ev.with_columns(pl.Series("pred_hgb", _ph), pl.Series("pred_rf", _pr))
+    mo.md(f"Predicciones listas para **{df_cmp.height:,}** filas de test.")
+    return df_cmp, hgb_final, rf_final
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **Comparación final en test.** Misma tabla que antes, con la red neuronal y los dos modelos de árboles
+    junto a OSRM. MAE es el error absoluto medio, RMSE penaliza más los errores grandes y el sesgo indica
+    si sobreestima (+) o subestima (−). La última columna es la mejora del MAE respecto de OSRM (negativa = peor).
+    """)
+    return
+
+
+@app.cell
+def _(df_cmp, mo, pl):
+    def _fila(df, momento, metodo, pred):
+        e = pl.col(pred) - pl.col("y_en_viaje_minutos")
+        r = df.select(
+            e.abs().mean().alias("mae"),
+            e.pow(2).mean().sqrt().alias("rmse"),
+            e.mean().alias("sesgo"),
+        ).row(0, named=True)
+        return {
+            "momento": momento,
+            "método": metodo,
+            "MAE (min)": round(r["mae"], 2),
+            "RMSE (min)": round(r["rmse"], 2),
+            "sesgo (min)": round(r["sesgo"], 2),
+        }
+
+    _t0 = df_cmp.filter(pl.col("segmento_orden_actual") == 1)
+    _en = df_cmp.filter(pl.col("segmento_orden_actual") > 1)
+    _filas = []
+    for _momento, _df, _osrm, _cal in [
+        ("Al salir (t=0)", _t0, "osrm_total_est_min", "osrm_cal_total"),
+        ("En ruta (t>0)", _en, "osrm_restante_est_min", "osrm_cal_rest"),
+    ]:
+        _bloque = [
+            _fila(_df, _momento, "OSRM", _osrm),
+            _fila(_df, _momento, "OSRM calibrado", _cal),
+            _fila(_df, _momento, "Red neuronal", "pred_modelo_min"),
+            _fila(_df, _momento, "HistGradientBoosting", "pred_hgb"),
+            _fila(_df, _momento, "Random Forest", "pred_rf"),
+        ]
+        _base = _bloque[0]["MAE (min)"]
+        for _f in _bloque:
+            _f["mejora MAE vs OSRM (%)"] = round(100 * (_base - _f["MAE (min)"]) / _base, 1)
+        _filas += _bloque
+    mo.ui.table(_filas, selection=None)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **Error según el avance del viaje.** MAE de los minutos restantes por bloque de progreso
+    (por posición en la lista de segmentos), para cada método. Muestra en qué parte del recorrido
+    mejora o empeora cada modelo.
+    """)
+    return
+
+
+@app.cell
+def _(df_cmp, mo, pl):
+    _bloque = (pl.col("pct_progreso_recorrido") // 25).clip(0, 3).cast(pl.Int32)
+    _etiqueta = (
+        pl.when(pl.col("bloque") == 0).then(pl.lit("0–25 %"))
+        .when(pl.col("bloque") == 1).then(pl.lit("25–50 %"))
+        .when(pl.col("bloque") == 2).then(pl.lit("50–75 %"))
+        .otherwise(pl.lit("75–100 %"))
+        .alias("avance del viaje")
+    )
+
+    def _mae(pred):
+        return (pl.col(pred) - pl.col("y_en_viaje_minutos")).abs().mean().round(2)
+
+    _por_avance = (
+        df_cmp.with_columns(_bloque.alias("bloque"))
+        .group_by("bloque")
+        .agg(
+            _mae("osrm_restante_est_min").alias("MAE OSRM"),
+            _mae("pred_modelo_min").alias("MAE red neuronal"),
+            _mae("pred_hgb").alias("MAE HistGradientBoosting"),
+            _mae("pred_rf").alias("MAE Random Forest"),
+            pl.len().alias("n filas"),
+        )
+        .sort("bloque")
+        .with_columns(_etiqueta)
+        .drop("bloque")
+    )
+    mo.ui.table(_por_avance.to_dicts(), selection=None)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **Importancia de las variables (Random Forest).** Indica cuánto usa el bosque cada variable de entrada
+    para reducir el error. Sirve para justificar qué variables importan y cuáles no aportan.
+    """)
+    return
+
+
+@app.cell
+def _(arb_nombres, mo, rf_final):
+    _imp = sorted(zip(arb_nombres, rf_final.feature_importances_), key=lambda x: -x[1])
+    mo.ui.table(
+        [{"variable": n, "importancia": round(float(v), 4)} for n, v in _imp[:12]],
+        selection=None,
     )
     return
 

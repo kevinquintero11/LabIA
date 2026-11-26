@@ -1,5 +1,6 @@
-marimo
-ijson
-pandas
-scikit-learn
-psycopg2
+marimo==0.25.0
+ijson==3.5.1
+numpy==2.5.3
+polars==2.1.0
+tensorflow==2.21.0
+scikit-learn==1.9.1

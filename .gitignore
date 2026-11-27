@@ -8,6 +8,9 @@ __marimo__/
 
 # Datos privados, bases generadas y resultados locales
 /data/
+/data-v2/
+/parquet/
+/*.zip
 /datos/
 /resultados/
 *.sqlite
@@ -16,6 +19,7 @@ __marimo__/
 *.parcial.sqlite*
 
 # Configuracion y metadatos locales
+/.kilo/
 .env
 .env.*
 !.env.example

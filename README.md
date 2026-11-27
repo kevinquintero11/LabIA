@@ -1,378 +1,138 @@
-# Proyecto ETA — predicción de tiempos de viaje
+# P3 — Predicción de tiempos de viaje y ETA
 
-Proyecto académico para estimar la duración de un viaje al salir y actualizar los minutos restantes durante el recorrido. La referencia de comparación es **OSRM**. Con las estimaciones se calculará una hora estimada de llegada (**ETA**) y se demostrará una regla de aviso de demora.
+Versión final del trabajo, implementada como una notebook interactiva de **Marimo** en `p3_idas_ult.py`.
 
-**Estado documentado:** importación local y exploración inicial con **marimo + SQLite**, utilizando `eta_importacion.py` (`VERSION = 1`). La reconstrucción definitiva de viajes, el panel de entrenamiento, los modelos y los avisos son etapas posteriores; no se generan automáticamente al importar los JSON.
+Reconstruye pasadas de ida a partir de hojas de ruta y registros GPS, genera un dataset por segmento y compara tres modelos para predecir los minutos restantes: **red neuronal (TensorFlow), HistGradientBoosting y Random Forest**. Las referencias son OSRM y OSRM calibrado con los viajes de entrenamiento. También calcula la hora estimada de llegada (ETA) y demuestra una regla de aviso de demora.
 
-**Modalidad del equipo:** cada integrante tiene el código compartido, una copia local de los mismos tres JSON y su propia base SQLite. Los datos grandes no se suben al repositorio.
-
-
-## Contenido
-
-[Inicio](#1-puesta-en-marcha) · [Dependencias](#2-dependencias-y-versiones) · [Marimo](#3-cómo-trabajar-con-marimo) · [Datos](#4-datos-y-rutas) · [Importación](#5-primera-ejecución-e-importación) · [Base SQLite](#6-qué-contiene-la-base-sqlite) · [Consultas](#7-consultar-y-entender-los-resultados) · [Trabajo diario](#8-volver-a-trabajar-y-reimportar) · [Equipo](#9-trabajo-en-equipo) · [Problemas](#10-problemas-frecuentes) · [Siguientes etapas](#11-siguientes-etapas-del-proyecto)
-
-## 1. Puesta en marcha
-
-### Requisitos previos
-
-Se propone utilizar **Python 3.11 o posterior**, acordando la misma versión menor entre integrantes. El módulo de importación requiere al menos Python 3.10; la compatibilidad de las bibliotecas instaladas también debe respetarse.
-
-Se necesita un navegador, permiso de escritura en la carpeta del proyecto y espacio para los JSON —aproximadamente **9 GB en total**, según la entrega—, la base SQLite, sus índices y archivos temporales. No se fija un mínimo de RAM ni una duración de importación: dependen del equipo y de la estructura de los documentos. La lectura incremental evita cargar el archivo completo, pero cada documento y los lotes en curso sí ocupan memoria.
-
-Para esta etapa **no hacen falta GPU, MongoDB, MySQL, un servidor OSRM, una cuenta de Colab ni una cuenta en marimo online**. La notebook ejecuta Python localmente. SQLite no requiere un servidor separado.[^sqlite]
-
-### Estructura de carpetas
-
-Clonar o descargar el repositorio compartido y organizarlo así:
+## Contenido del repositorio
 
 ```text
 LabIA/
+├── p3_idas_ult.py       # Notebook final: reconstrucción, dataset, modelos y evaluación
+├── bson.py              # Conversión de IDs, números y fechas de MongoDB Extended JSON
+├── requirements.txt     # Versiones de las dependencias directas
 ├── README.md
-├── eta.py                         # Notebook de marimo del equipo
-├── eta_importacion.py              # Funciones de importación y consulta
-├── requirements.txt                # Dependencias mínimas
-├── .gitignore
-├── .venv/                          # Se crea en cada computadora; no se comparte
-├── datos/
-│   ├── originales/                 # Copia local de los tres archivos entregados
-│   │   ├── hojaDeRuta.json
-│   │   ├── rastreoSatelital.json
-│   │   └── observacionesSegmentosViales.json
-│   └── procesados/
-│       └── eta_datos_v1.sqlite     # Se genera al completar la importación
-└── resultados/                     # Opcional: reportes y resultados posteriores
+└── .gitignore
 ```
 
-`requirements-lock.txt`, cuando el equipo lo genere, también se guarda en la raíz. No viene implícito con Python ni se crea al abrir marimo.
+Los datos y archivos generados se mantienen localmente:
 
-### Windows — PowerShell
-
-Abrir una terminal **en la raíz del proyecto**, donde están `eta.py` y `eta_importacion.py`:
-
-```powershell
-py -3 --version
-py -3 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m pip check
-.\.venv\Scripts\marimo.exe edit eta.py
+```text
+LabIA/
+├── data-v2/
+│   ├── hojaDeRuta.json
+│   └── rastreoSatelital.json
+├── parquet/                         # Se crea al ejecutar los botones
+│   ├── p3_cuentas/                  # Ejemplo, mapas y conteo de pasadas
+│   └── dataset_p3_idas/
+│       ├── partes/part_*.parquet    # Dataset por fragmentos
+│       └── meta_dataset.json       # Corte temporal y transformación de variables
+└── .venv/                           # Entorno Python local
 ```
 
-Si el equipo acordó una versión concreta, seleccionarla al crear el entorno; por ejemplo, `py -3.12 -m venv .venv` requiere tener Python 3.12 instalado. Si `py` no está disponible pero `python` apunta a la instalación correcta, usar `python -m venv .venv`.
+`bson.py` es un módulo propio necesario para ejecutar la notebook; no requiere instalar el paquete `bson`.
 
-### Linux o macOS
+## Requisitos
 
-También desde la raíz del proyecto:
+- **Python 3.12**, versión usada para verificar esta entrega.
+- Un navegador y espacio libre para los JSON, los Parquet finales y los temporales de procesamiento.
+- Las dos entradas recortadas de la entrega, obtenidas por el canal de datos del equipo. **Clonar el repositorio no descarga los JSON.** El rastreo puede ocupar varios GB.
+
+El procesamiento y el entrenamiento pueden ejecutarse en CPU. No se requiere un servidor de base de datos ni un servidor OSRM: se utilizan las geometrías y duraciones que ya contienen las hojas.
+
+## Instalación y apertura
+
+Ejecutar los comandos desde la raíz del repositorio.
+
+### Linux
 
 ```bash
-python3 --version
-python3 -m venv .venv
+python3.12 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m pip check
-.venv/bin/marimo edit eta.py
+.venv/bin/marimo edit p3_idas_ult.py
 ```
 
-Seleccionar un ejecutable específico, como `python3.12`, cuando corresponda a la versión acordada. Si la distribución no incluye el soporte para `venv`, instalarlo mediante su gestor de paquetes antes de continuar.
-
-**No es necesario activar el entorno:** los comandos anteriores usan directamente sus ejecutables. Esto también evita tener que modificar la política de ejecución de PowerShell. Cada integrante crea su propia `.venv`; no se copia la de otra computadora.[^venv]
-
-Al ejecutar `marimo edit`, se abre el editor en el navegador. Si no se abre automáticamente, copiar la dirección que muestra la terminal, incluido el token cuando corresponda. Mantener esa terminal abierta mientras se trabaja.[^marimo]
-
-## 2. Dependencias y versiones
-
-### Dependencias actuales
-
-El archivo `requirements.txt` mínimo contiene:
-
-```text
-marimo
-ijson
-```
-
-| Componente | Función en esta etapa |
-|---|---|
-| `marimo` | Editor de la notebook, ejecución de celdas, tablas y botón de importación. |
-| `ijson` | Lectura incremental de los arrays JSON. |
-| `sqlite3` | Creación y consulta de SQLite; pertenece a la biblioteca estándar de Python. |
-| `pathlib`, `json`, `shutil`, `itertools`, etc. | Rutas, configuración y utilidades; también forman parte de Python. |
-
-No ejecutar `pip install sqlite3`, `pip install pathlib` ni instalar `eta_importacion`: este último es el archivo local del repositorio. `ijson` se importa cuando se leen los originales; las funciones de consulta a una base ya creada no lo necesitan.[^importador][^ijson]
-
-`pandas`, `numpy`, `pyarrow`, `matplotlib`, `scikit-learn` y `xgboost` pueden incorporarse para exploración o modelado posterior. **No son necesarias para las celdas actuales que muestran listas de diccionarios con `mo.ui.table`.** Instalar bibliotecas no agrega por sí solo entrenamiento a la notebook.
-
-### Fijar las versiones que ya funcionan
-
-El archivo mínimo identifica dependencias, pero **sin versiones fijadas no garantiza instalaciones idénticas en distintas fechas**. Antes de distribuir un entorno de referencia, una persona debe registrar las versiones de su entorno funcional.
-
-Windows:
+### Windows — PowerShell
 
 ```powershell
-.\.venv\Scripts\python.exe --version
-.\.venv\Scripts\python.exe -m pip freeze | Set-Content -Encoding utf8 requirements-lock.txt
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip check
+.\.venv\Scripts\marimo.exe edit p3_idas_ult.py
 ```
 
-Linux/macOS:
+No hace falta activar el entorno: los comandos usan sus ejecutables directamente. Marimo abre el editor en el navegador; mantener la terminal abierta durante el trabajo y detenerlo con `Ctrl+C` al terminar.
+
+Para presentar la notebook como aplicación, reemplazar `edit` por `run`:
 
 ```bash
-.venv/bin/python --version
-.venv/bin/python -m pip freeze > requirements-lock.txt
+.venv/bin/marimo run p3_idas_ult.py
 ```
 
-Revisar ese archivo antes de subirlo: no debe incluir rutas privadas ni paquetes ajenos al proyecto. `pip freeze` registra lo instalado; no demuestra que el entorno sea portable ni que las pruebas hayan pasado. Registrar también versión de Python y sistema operativo.[^pip]
+## Preparar los datos
 
-Cuando el equipo haya validado el archivo, los demás reemplazan el comando de instalación por `python -m pip install -r requirements-lock.txt`, usando el ejecutable de su `.venv`. No sobrescribir el archivo compartido desde cada computadora ni actualizar paquetes sin coordinarlo.
+Crear `data-v2/` junto a la notebook y colocar allí los archivos con estos nombres exactos:
 
-## 3. Cómo trabajar con marimo
-
-### Notebook, editor y código
-
-Marimo guarda la notebook como un archivo Python (`eta.py`), no como un `.ipynb`. El navegador es la interfaz; Python y los archivos están en la computadora que ejecutó marimo. El `.py` contiene el código y los textos, no una copia de los JSON ni todas las salidas de la sesión.[^marimo][^jupyter]
-
-Para desarrollar se utiliza **`marimo edit eta.py`**. El modo `marimo run` presenta la notebook como aplicación sin editor: no es el modo de trabajo de este proyecto.
-
-### Celdas y dependencias
-
-Una celda puede definir variables, funciones, texto o una consulta. Marimo determina las dependencias a partir de las variables definidas y utilizadas. En ejecución automática, actualizar una celda puede volver a ejecutar sus dependientes; el orden visual no es lo que determina el orden de cálculo.[^reactividad]
-
-Ejemplo conceptual:
-
-```text
-Rutas de archivos
-       ↓
-Importación o reutilización de SQLite
-       ↓
-Consultas → tablas y exploración
-```
-
-**Un nombre global debe definirse en una sola celda.** No repetir `import marimo as mo`, `from pathlib import Path` o `BASE_ETA = ...` en diferentes celdas. Cambiar la definición original o usar nombres distintos. Las variables que empiezan con `_`, como `_ruta`, son locales a su celda en marimo. Además, modificar internamente un objeto en otra celda no dispara necesariamente la reactividad: es preferible producir un nuevo resultado.[^reactividad]
-
-Los ejemplos de este README explican las celdas existentes; **no deben pegarse todos nuevamente** si sus variables ya están definidas. Tampoco hay que pegar los decoradores `@app.cell` en el editor de una celda: marimo administra la estructura del archivo.
-
-### Configuración para este dataset
-
-Cada integrante debe revisar los ajustes del editor:
-
-| Ajuste | Configuración de trabajo propuesta |
+| Archivo | Campos utilizados |
 |---|---|
-| `On startup` | Desactivar la ejecución automática al abrir. |
-| `On cell change` | Usar `lazy`. |
-| `On module change` | Usar `lazy` si se habilita la recarga de módulos. |
+| `hojaDeRuta.json` | `_id`, vehículo, fechas de vigencia y `geometriaOSRM.ida` (puntos, duración y analítica de segmentos). |
+| `rastreoSatelital.json` | `flotaID`, `fecha` y `location.coordinates`. |
 
-En modo `lazy`, las celdas afectadas quedan pendientes en lugar de ejecutarse inmediatamente. Al ejecutar una celda, marimo también puede actualizar sus dependencias pendientes. No interpretar este modo como una prohibición absoluta de ejecutar código costoso.[^runtime]
+**Formato importante:** el lector de hojas espera un documento JSON completo por línea, opcionalmente con coma al final y con `[` y `]` en líneas separadas. Un JSON reformateado en varias líneas por documento no es compatible con este lector. El rastreo se lee incrementalmente como un array JSON mediante `ijson`.
 
-Ejecutar una celda con su botón de ejecución o los atajos del editor. El panel de variables ayuda a inspeccionar resultados, y el grafo de dependencias explica por qué una celda necesita otra. Para registrar resultados visibles puede exportarse la vista a HTML desde el menú; revisar su contenido antes de compartirlo.[^editor]
+Las coordenadas de la ida están en **`[latitud, longitud]`** y las del GPS en **`[longitud, latitud]`**. Se conservan puntos con latitud entre −50 y −20 y longitud entre −80 y −50. Las fechas se procesan en UTC.
 
-No usar `%pip`, `!pip`, `%cd` o `drive.mount` de Colab en estas celdas. En este proyecto, las instalaciones se hacen desde la terminal usando el Python del entorno.[^jupyter]
+Las rutas se resuelven respecto del archivo Python. Si se necesita otra ubicación, modificar `HDR`, `GPS` y `CACHE` en la celda de rutas. `observacionesSegmentosViales.json` no se utiliza en este flujo.
 
-## 4. Datos y rutas
+## Cómo ejecutar el trabajo
 
-### Qué contiene cada JSON
+El procesamiento pesado se inicia mediante botones. En el editor, si hay celdas pendientes por la configuración de ejecución, ejecutarlas para actualizar sus resultados y dependencias.
 
-| Archivo | Información principal | Papel en el proyecto |
-|---|---|---|
-| `hojaDeRuta.json` | Vehículo, ventana de fechas, geometrías OSRM, segmentos y posibles paradas. | Describe el plan y la referencia de duración. |
-| `rastreoSatelital.json` | Vehículo, fecha, coordenadas, velocidad y evento. | Permite estudiar el avance registrado. |
-| `observacionesSegmentosViales.json` | Vehículo, fecha, nodos del tramo y `tiempo_real`. | Aporta los tiempos observados para construir la etiqueta. |
+1. **Exploración opcional — “Ver la primera hoja”.** Busca entre las primeras 15 hojas válidas una con GPS en su vigencia. Muestra tres mapas (ida, pings y búsqueda) y una tabla de pasadas. Recorre el archivo de GPS completo.
+2. **Conteo opcional — “Contar todas”.** Aplica las reglas a todas las hojas válidas y muestra los totales por vigencia. Guarda el resultado en `parquet/p3_cuentas/`.
+3. **“Armar dataset P3 en disco (baja RAM)”.** Genera los fragmentos y metadatos en `parquet/dataset_p3_idas/`. La configuración final es `variantes=("ida",)`, `nivel="segmento"` y `objetivo="y_en_viaje_minutos"`. Las celdas posteriores de evaluación requieren esta configuración.
+4. **Red neuronal.** Al completarse el dataset, la celda dependiente entrena automáticamente durante **50 épocas**. Usa dos capas densas de 25 unidades con ReLU, dropout de 0,3, salida lineal y Adam. Después se calculan predicciones, métricas, ETA y avisos. La red usa el conjunto de test como `validation_data` durante el entrenamiento; no tiene una validación interna separada.
+5. **Árboles.** Ejecutar “Buscar configuración: HistGradientBoosting” y “Buscar configuración: Random Forest”. Se prueban 72 y 24 combinaciones, respectivamente, sobre una partición temporal interna de train. Cuando ambas búsquedas terminan, se ajustan los modelos finales y aparece la comparación conjunta en test y la importancia de variables del bosque.
+6. **Avisos.** Ajustar el deslizador “Tolerancia del aviso (min)” (5 minutos inicialmente) para recalcular los avisos de OSRM y de la red neuronal.
 
-Según la consigna, son **arrays JSON** `[{...}, {...}]` con documentos estilo `mongoexport`. No tienen que estar organizados como una fila física por documento. Las envolturas `$date` y `$oid` se procesan al importar.[^consigna]
+La exploración y el conteo cargan en memoria los pings de los vehículos seleccionados. El constructor del dataset distribuye el GPS en cubetas temporales en disco, aunque cada cubeta y las geometrías requieren RAM. Para reducir el tamaño de cada cubeta, aumentar `n_buckets` de 32 a 64. Las búsquedas de árboles y la evaluación también utilizan matrices en memoria.
 
-Los tres archivos deben proceder de la misma versión de la entrega. Cada integrante obtiene su copia mediante el canal privado acordado; `git clone` no descarga los datos. No modificar los originales durante la importación.
+**Volver a ejecutar el botón del dataset reemplaza sus fragmentos anteriores.** Los modelos y métricas se mantienen en la sesión: el código no guarda automáticamente modelos entrenados ni reportes finales. Los mapas y el conteo sí pueden mostrar su caché al reabrir; para el flujo de entrenamiento actual hay que volver a construir el dataset con su botón.
 
-### Rutas configuradas en la notebook
+## Criterios del dataset y evaluación
 
-La celda inicial contiene esta configuración:
+- Un ping se asocia a la ida si está a **250 m o menos**. Se usa el vértice más cercano y se agregan puntos de búsqueda en tramos largos con un paso de referencia de 200 m.
+- Salida y llegada corresponden al **primer y último 15 % de la lista de vértices**, no al porcentaje de kilómetros recorridos. La llegada de la etiqueta se alcanza a partir del 85 % de esa lista.
+- Un retroceso superior a 3 posiciones corta la pasada. Un silencio de más de una hora la corta solo en las puntas. Se descartan pasadas de menos de dos pings o con avance inferior al 5 %.
+- El reloj excluye la espera quieta inicial y termina en el primer ping de llegada. Para generar el dataset se conservan idas completas con duración entre **0,5 y 3 veces** la duración OSRM.
+- El conteo exploratorio restringe las vigencias al período **1 de junio–29 de octubre de 2026 (UTC)**. El constructor streaming usa las vigencias de los archivos de entrada sin aplicar ese mismo filtro de fechas; sus totales pueden diferir.
+- En modo segmento, la analítica debe tener un elemento por par de vértices consecutivos. Si no existe, se generan identificadores por posición; si existe pero no coincide en longitud, se detiene la construcción con un error.
+- La duración OSRM restante se aproxima proporcionalmente al orden de los segmentos. El instante por segmento se interpola entre los pings: no es una observación GPS directa de cada tramo.
+- La partición se realiza por días de salida: aproximadamente **80 % de días para train y 20 % para test**. Los viajes que cruzan el corte se excluyen. Se necesitan al menos dos días distintos con pasadas válidas y viajes en ambos conjuntos.
+- Medianas, normalización y vocabulario de categorías se calculan sobre train. Los árboles usan una muestra de un instante cada 30 segmentos, incluyendo la salida (`PASO_ARB = 30`).
 
-```python
-from pathlib import Path
+Las tablas comparan **MAE, RMSE y sesgo en minutos**, al salir y en ruta, además del error por avance. OSRM calibrado multiplica su duración por la mediana de `real / OSRM` de los viajes de train.
 
-PROYECTO = Path.cwd()
-ORIGINALES = PROYECTO / "datos" / "originales"
-PROCESADOS = PROYECTO / "datos" / "procesados"
-PROCESADOS.mkdir(parents=True, exist_ok=True)
-```
+La regla de aviso se activa cuando `ETA en ruta > ETA al salir + tolerancia`. La evaluación del aviso muestra precisión, recall y anticipación mediana por viaje. Cada fuente se evalúa contra su propia ETA inicial. La inspección final de campos de paradas es exploratoria; no implementa un aviso contra un horario programado.
 
-`Path.cwd()` representa el directorio de trabajo. Por eso se inicia marimo desde la raíz del proyecto. No cambiar silenciosamente de carpeta a mitad de la notebook. Si los archivos están en otro disco, ajustar `ORIGINALES` en su celda original y evitar subir una ruta personal como configuración común.
+## Verificación y problemas frecuentes
 
-La asociación de nombres y el destino son:
-
-```python
-ARCHIVOS_ETA = {
-    "hojas": ORIGINALES / "hojaDeRuta.json",
-    "gps": ORIGINALES / "rastreoSatelital.json",
-    "observaciones": ORIGINALES / "observacionesSegmentosViales.json",
-}
-BASE_ETA = PROCESADOS / "eta_datos_v1.sqlite"
-```
-
-Las claves `hojas`, `gps` y `observaciones` son las que espera el importador. Comprobar los nombres completos de los archivos, incluidas mayúsculas, extensión y posibles sufijos de descarga.
-
-## 5. Primera ejecución e importación
-
-Recorrer las celdas de la notebook hasta obtener lo siguiente:
-
-| Bloque | Resultado esperado |
-|---|---|
-| Rutas y vista previa | Se encuentran los archivos y se muestran pocos documentos, no el dataset completo. |
-| Funciones auxiliares | Se importan `importar_dataset`, `consultar_base` y `ejemplo_geometria`. |
-| Tamaños y espacio libre | Se conocen las rutas de entrada y salida y el espacio disponible. |
-| Botón de importación | Aparece **Importar los tres JSON a SQLite**. |
-| Importación | Se crea o reutiliza la base y se muestra el resumen. |
-| Exploración | Se muestran hojas, incidencias, una geometría y recorridos candidatos. |
-
-La operación central es:
-
-```python
-resumen_importacion_eta = importar_dataset(
-    archivos=ARCHIVOS_ETA,
-    destino=BASE_ETA,
-    lote=5_000,
-)
-BASE_ETA_LISTA = Path(resumen_importacion_eta["base"])
-```
-
-El botón y `mo.stop` controlan el inicio cuando no existe la base. Si en modo `lazy` queda una celda pendiente, ejecutar la celda de importación según lo indique el editor. No lanzar una segunda importación mientras la primera sigue activa.[^jupyter]
-
-### Qué hace realmente el importador
-
-Lee un documento a la vez con `ijson`, extrae los campos previstos, guarda las mediciones en lotes y crea índices. `lote=5_000` es el tamaño del lote de GPS y observaciones, **no un límite del total de registros**. Las hojas se procesan individualmente y se confirman periódicamente.[^importador]
-
-Durante la ejecución se verán mensajes de lectura y creación de índices. La etapa de índices también puede demorar aunque hayan terminado los mensajes de lectura. No hay un tiempo fijo prometido.
-
-El programa crea un archivo temporal `*.parcial.sqlite` y un bloqueo `eta_datos_v1.sqlite.lock`. El archivo final se publica cuando la importación concluye. Ante un error que permite ejecutar la limpieza se eliminan esos temporales; un cierre forzado puede dejarlos. No se modifican los JSON ni se sobrescribe una base existente incompatible.[^importador]
-
-La lectura incremental reduce la necesidad de cargar datos simultáneamente, pero una hoja muy grande todavía debe entrar como documento en memoria. Además, `hojas.documento_json` conserva su contenido serializado y los índices ocupan disco: el tamaño final no se deduce directamente de los 9 GB originales.
-
-### Resumen e incidencias
-
-`resumen_importacion_eta` contiene `base`, `firma`, `tablas`, `incidencias`, `segundos_importacion`, `reutilizada` y `notas`. También se guarda dentro de SQLite, en `control`. **Esta versión no crea automáticamente un archivo externo `resumen_importacion.json`.**
-
-Los conteos representan filas importadas, no viajes utilizables para entrenar. Las incidencias son contadores, no una depuración completa: por ejemplo, `gps_velocidad_cero_conservados` informa que se conservaron mediciones con velocidad cero, no que deban eliminarse.
-
-## 6. Qué contiene la base SQLite
-
-Los tres JSON no se convierten necesariamente en tres tablas. `hojaDeRuta.json` contiene información anidada de hojas, recorridos y segmentos; se separa en tres tablas para evitar repetir los datos de una hoja por cada segmento y facilitar las consultas.
-
-| Origen | Tablas generadas |
-|---|---|
-| `hojaDeRuta.json` | `hojas`, `recorridos`, `segmentos` |
-| `rastreoSatelital.json` | `gps` |
-| `observacionesSegmentosViales.json` | `observaciones` |
-| Metadatos de la importación | `control` |
-
-La relación principal es `hojas` → `recorridos` → `segmentos`. Las mediciones de `gps` y `observaciones` se relacionan posteriormente mediante vehículo, fecha y, para las observaciones, los nodos del segmento.
-
-El esquema efectivo de `eta_importacion.py` es:[^importador]
-
-| Tabla | Columnas principales | Significado |
-|---|---|---|
-| `hojas` | `hoja_n`, `hoja_id`, `flota_id`, `tipo_vehiculo`, fechas UTC, `ventana_positiva`, `estado`, `documento_json` | Una fila por documento de hoja. |
-| `recorridos` | `recorrido_id`, `hoja_n`, `variante`, `ruta_json`, `n_segmentos`, `duracion_osrm_original`, `distancia_osrm` | Geometrías detectadas dentro de cada hoja. |
-| `segmentos` | `recorrido_id`, `orden`, `origen`, `destino` | Nodos y posición del segmento en la lista. |
-| `gps` | `gps_n`, `flota_id`, `fecha_utc`, `longitud`, `latitud`, `velocidad`, `evento`, `campos_minimos_ok` | Mediciones GPS normalizadas. |
-| `observaciones` | `observacion_n`, `flota_id`, `fecha_utc`, nodos, `franja_horaria`, `tiempo_real_seg`, `campos_minimos_ok` | Mediciones de duración por tramo, conservadas en segundos. |
-| `control` | `clave`, `valor` | Metadatos y resultado de la importación. |
-
-**Detalles que conviene conocer:**
-
-- `hoja_n`, `gps_n` y `observacion_n` son posiciones en sus arrays originales, comenzando en 1. No son identificadores universales entre exportaciones reorganizadas. `segmentos.orden` comienza en 0.
-- `recorridos.ruta_json` es una lista de claves o índices para localizar la geometría dentro de `hojas.documento_json`. **No contiene las coordenadas del recorrido.** Los detalles y tiempos estimados de los segmentos siguen en ese documento; no existe una columna de duración por segmento en la tabla `segmentos` de esta versión.
-- `n_segmentos` cuenta elementos de la lista original; puede diferir del número de filas insertadas si había elementos que no eran documentos. No certifica cobertura observada.
-
-### Fechas, unidades y controles
-
-Las fechas reconocidas se normalizan a UTC en formato fijo. Las fechas sin zona horaria no se asumen UTC: quedan sin valor normalizado. La conversión a hora local para futuros atributos debe definirse por separado.
-
-`tiempo_real_seg` conserva los segundos de la consigna. Para consultar minutos puede calcularse `tiempo_real_seg / 60.0`. Los tiempos y distancias OSRM mantienen sus unidades de origen hasta verificar la exportación. Los nodos se guardan como texto para conservar sus identificadores.[^importador][^consigna]
-
-| Indicador | Qué comprueba | Qué no garantiza |
-|---|---|---|
-| `ventana_positiva` | Fechas interpretables y final posterior al inicio. | Que esas fechas sean salida y llegada reales. |
-| `gps.campos_minimos_ok` | Vehículo, fecha y coordenadas en rangos básicos. | Calidad del recorrido o validez de la velocidad; esta última se revisa por separado. |
-| `observaciones.campos_minimos_ok` | Vehículo, fecha, nodos y tiempo positivo. | Que la observación pertenezca a una pasada concreta. |
-
-No hay eliminación general de duplicados ni identificación automática de viajes en esta etapa. Una hoja, una geometría, un punto GPS y una observación de tramo representan cosas diferentes.
-
-## 7. Consultar y entender los resultados
-
-Estas funciones se importan desde `eta_importacion.py`; no requieren pandas:
-
-```python
-from eta_importacion import (
-    importar_dataset,
-    consultar_base,
-    ejemplo_geometria,
-)
-```
-
-### Consultar pocas filas
-
-Ejemplo para una celda, después de disponer de `BASE_ETA_LISTA`:
-
-```python
-muestra_observaciones_readme = consultar_base(
-    BASE_ETA_LISTA,
-    """
-    SELECT flota_id, fecha_utc, nodo_origen, nodo_destino,
-           tiempo_real_seg, tiempo_real_seg / 60.0 AS tiempo_real_min
-    FROM observaciones
-    WHERE campos_minimos_ok = 1
-    ORDER BY observacion_n
-    LIMIT 10
-    """,
-)
-mo.ui.table(muestra_observaciones_readme, selection=None)
-```
-
-`consultar_base(base, sql, parametros=(), max_filas=1000)` devuelve una lista de diccionarios y abre la base en modo de solo lectura. Si obtiene más de `max_filas`, genera un error: usar `LIMIT`, filtros o agregaciones. Este límite protege el tamaño de la salida; no garantiza que una consulta costosa ejecute poco trabajo.
-
-Para incorporar valores externos al SQL, utilizar `?` y `parametros`, no concatenar texto. Una consulta de rangos debe mantener el mismo formato temporal normalizado que las columnas.
-
-### Inspeccionar geometrías
-
-```python
-geometria_revision_readme = ejemplo_geometria(BASE_ETA_LISTA)
-print(json.dumps(geometria_revision_readme, indent=2, ensure_ascii=False))
-```
-
-Muestra una vista acotada con la variante, los campos OSRM y los dos primeros segmentos. Acepta también `recorrido_id=...` para elegir uno. Algunas listas internas se abrevian: la vista previa no es una exportación completa.
-
-### Interpretar candidatos
-
-La consulta de candidatos de la notebook relaciona vehículo, ventana temporal y nodos del recorrido. Estas son las claves indicadas en la consigna, que advierte que un mismo tramo puede pertenecer a varias hojas.[^consigna]
-
-**Un candidato no es todavía un viaje reconstruido.** La existencia de un GPS y una observación compatible no demuestra cobertura completa, secuencia correcta ni ausencia de pasadas repetidas. No sumar sus tiempos directamente para entrenar.
-
-## 8. Volver a trabajar y reimportar
-
-### Aperturas posteriores
-
-Abrir la terminal en la raíz y ejecutar solamente el comando de marimo del entorno:
-
-```powershell
-# Windows
-.\.venv\Scripts\marimo.exe edit eta.py
-```
+Para validar la estructura de la notebook:
 
 ```bash
-# Linux/macOS
-.venv/bin/marimo edit eta.py
+.venv/bin/marimo check p3_idas_ult.py
 ```
 
-No recrear `.venv` ni reinstalar paquetes cada vez. Ejecutar las celdas pendientes: el importador recupera la base completa cuando coincide su firma y muestra `Base completa encontrada: no se vuelven a leer los JSON.`
+| Problema | Qué revisar |
+|---|---|
+| `FileNotFoundError` | La ubicación y nombres de los dos JSON en `data-v2/`. |
+| Error de JSON en hojas | Que cada documento esté completo en una sola línea. |
+| No se encuentran pasadas válidas | Vehículos, fechas, coordenadas y cobertura entre ambas entradas. |
+| Incompatibilidad entre segmentos y vértices | La alineación de `analitica_segmentos` con la geometría de ida. |
+| Falta de memoria o búsqueda muy lenta | Aumentar `n_buckets`, aumentar `PASO_ARB` o reducir las listas de `GRID_HGB` y `GRID_RF`. |
+| Celdas de entrenamiento bloqueadas | Ejecutar el botón del dataset y esperar su finalización; para la comparación final se necesitan ambas búsquedas de árboles. |
 
-La firma compara **`VERSION`, rutas absolutas, tamaños y fechas de modificación**. No compara SHA-256 ni todo el código fuente. Por eso:
-
-- Los originales deben seguir accesibles al llamar a `importar_dataset`, incluso para reutilizar la base.
-- Mover un archivo o copiar la base de otro integrante puede causar una firma diferente aunque los datos sean iguales.
-- Una modificación del código no se detecta automáticamente si no cambia `VERSION`. Los cambios de transformación deben versionarse y documentarse.
-
-Las funciones de consulta sí pueden leer una base completa directamente sin volver a comprobar los originales. Esto no cambia la política del grupo de conservarlos para reproducir el procesamiento.
-
-### Cambios e interrupciones
-
-Si cambia el dataset o el importador, conservar la base anterior y elegir otro destino, por ejemplo `eta_datos_v2.sqlite`, modificando **la definición existente** de `BASE_ETA`. Asegurar espacio para ambas bases.
-
-La versión actual **no reanuda importaciones interrumpidas**. Si hubo un cierre forzado, primero verificar que no sigue activo ningún proceso importador. Solo entonces revisar y retirar el bloqueo huérfano y los temporales de esa ejecución. Nunca quitar un `.lock` para permitir dos escritores simultáneos.
-
-Guardar los cambios de la notebook y esperar a que termine la importación antes de cerrar marimo. Para finalizar la sesión, detenerlo en la terminal con `Ctrl+C`. La base completa permanece en disco; las variables en memoria se reconstruyen al ejecutar nuevamente las celdas.
+`.gitignore` excluye los datos, ZIP de la entrega, Parquet generados, el entorno virtual y el estado local de Marimo. Para reproducir el trabajo en otra computadora, instalar las dependencias y copiar las mismas dos entradas.
